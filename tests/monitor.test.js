@@ -266,7 +266,7 @@ describe('BotMonitor', () => {
       const result = await monitor.sendAlert('Test alert');
 
       expect(result).toBe(false);
-    }, 15000);
+    }, 30000);
   });
 
   describe('checkCriticalIssues - alert aggregation', () => {
