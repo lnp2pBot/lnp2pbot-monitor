@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="lnp2pBot Monitor" width="200">
+</p>
+
 # lnp2pBot Health Monitor
 
 **External health monitoring service for lnp2pBot** - Receives push-based heartbeats and sends intelligent alerts when the bot experiences issues.
