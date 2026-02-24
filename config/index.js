@@ -7,7 +7,9 @@ const config = {
   
   // Telegram bot configuration (required)
   TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
-  ADMIN_CHAT_ID: process.env.ADMIN_CHAT_ID,
+  ADMIN_CHAT_IDS: process.env.ADMIN_CHAT_ID
+    ? process.env.ADMIN_CHAT_ID.split(',').map(id => id.trim()).filter(Boolean)
+    : [],
   
   // Authentication (optional)
   AUTH_TOKEN: process.env.AUTH_TOKEN,
@@ -29,15 +31,16 @@ const config = {
 };
 
 // Validation
-const requiredConfig = ['TELEGRAM_BOT_TOKEN', 'ADMIN_CHAT_ID'];
+const requiredConfig = ['TELEGRAM_BOT_TOKEN'];
 const missingConfig = requiredConfig.filter(key => !config[key]);
+if (config.ADMIN_CHAT_IDS.length === 0) missingConfig.push('ADMIN_CHAT_ID');
 
 if (missingConfig.length > 0) {
   console.error('❌ Missing required environment variables:', missingConfig.join(', '));
   console.error('');
   console.error('Required configuration:');
   console.error('  TELEGRAM_BOT_TOKEN - Telegram bot token for sending alerts');
-  console.error('  ADMIN_CHAT_ID - Telegram chat ID to send alerts to');
+  console.error('  ADMIN_CHAT_ID - Comma-separated list of Telegram chat IDs to send alerts to');
   console.error('');
   console.error('Optional configuration:');
   console.error('  AUTH_TOKEN - Authentication token for heartbeat endpoint');
@@ -49,7 +52,7 @@ if (missingConfig.length > 0) {
   console.error('');
   console.error('Example .env file:');
   console.error('  TELEGRAM_BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrsTUVwxyz');
-  console.error('  ADMIN_CHAT_ID=-1001234567890');
+  console.error('  ADMIN_CHAT_ID=-1001234567890,477262720');
   console.error('  AUTH_TOKEN=super-secret-token');
   console.error('');
   process.exit(1);
@@ -85,10 +88,12 @@ if (config.TELEGRAM_BOT_TOKEN && !config.TELEGRAM_BOT_TOKEN.match(/^\d+:[A-Za-z0
   process.exit(1);
 }
 
-if (config.ADMIN_CHAT_ID && !config.ADMIN_CHAT_ID.match(/^-?\d+$/)) {
-  console.error('❌ ADMIN_CHAT_ID must be a number (e.g., -1001234567890 for groups, 1234567890 for private chats)');
-  console.error('   Get your chat ID by messaging @userinfobot on Telegram');
-  process.exit(1);
+for (const chatId of config.ADMIN_CHAT_IDS) {
+  if (!chatId.match(/^-?\d+$/)) {
+    console.error(`❌ Invalid ADMIN_CHAT_ID value: "${chatId}" — must be a number (e.g., -1001234567890 for groups, 1234567890 for private chats)`);
+    console.error('   Separate multiple IDs with commas: ADMIN_CHAT_ID=12345,54321');
+    process.exit(1);
+  }
 }
 
 // Log configuration (excluding sensitive values)
@@ -97,7 +102,7 @@ if (config.NODE_ENV === 'development') {
   console.log('  PORT:', config.PORT);
   console.log('  NODE_ENV:', config.NODE_ENV);
   console.log('  TELEGRAM_BOT_TOKEN:', config.TELEGRAM_BOT_TOKEN ? '✅ Set' : '❌ Missing');
-  console.log('  ADMIN_CHAT_ID:', config.ADMIN_CHAT_ID ? '✅ Set' : '❌ Missing');
+  console.log('  ADMIN_CHAT_IDS:', config.ADMIN_CHAT_IDS.length > 0 ? `✅ ${config.ADMIN_CHAT_IDS.length} recipient(s)` : '❌ Missing');
   console.log('  AUTH_TOKEN:', config.AUTH_TOKEN ? '✅ Set' : '⚠️ Not set (authentication disabled)');
   console.log('  MISSING_HEARTBEAT_THRESHOLD:', config.MISSING_HEARTBEAT_THRESHOLD, 'minutes');
   console.log('  CRITICAL_ALERT_THROTTLE:', config.CRITICAL_ALERT_THROTTLE, 'minutes');

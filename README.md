@@ -77,7 +77,7 @@ This service is part of the **lnp2pBot Health Monitoring System** described in [
 |----------|----------|---------|-------------|
 | `PORT` | No | `3000` | Server port |
 | `TELEGRAM_BOT_TOKEN` | Yes | - | Bot token for sending alerts |
-| `ADMIN_CHAT_ID` | Yes | - | Telegram chat ID for alerts |
+| `ADMIN_CHAT_ID` | Yes | - | Comma-separated list of Telegram chat IDs for alerts |
 | `AUTH_TOKEN` | No | - | Optional authentication token |
 | `MISSING_HEARTBEAT_THRESHOLD` | No | `6` | Minutes before missing heartbeat alert |
 | `CRITICAL_ALERT_THROTTLE` | No | `5` | Minutes between critical alerts |
@@ -89,7 +89,7 @@ This service is part of the **lnp2pBot Health Monitoring System** described in [
 ```bash
 # Required
 TELEGRAM_BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrsTUVwxyz
-ADMIN_CHAT_ID=-1001234567890
+ADMIN_CHAT_ID=-1001234567890,477262720
 
 # Optional
 AUTH_TOKEN=super-secret-token-here
@@ -206,7 +206,7 @@ This service is designed for easy deployment on Digital Ocean App Platform.
 3. **Environment Variables** in DO App Platform:
    ```
    TELEGRAM_BOT_TOKEN=your_bot_token
-   ADMIN_CHAT_ID=your_chat_id
+   ADMIN_CHAT_ID=chat_id1,chat_id2
    AUTH_TOKEN=your_secret_token
    ```
 
@@ -239,7 +239,7 @@ docker build -t lnp2pbot-monitor .
 docker run -d \
   -p 3000:3000 \
   -e TELEGRAM_BOT_TOKEN=your_token \
-  -e ADMIN_CHAT_ID=your_chat_id \
+  -e ADMIN_CHAT_ID=chat_id1,chat_id2 \
   lnp2pbot-monitor
 ```
 
@@ -251,7 +251,7 @@ git push heroku main
 
 # Set environment variables
 heroku config:set TELEGRAM_BOT_TOKEN=your_token
-heroku config:set ADMIN_CHAT_ID=your_chat_id
+heroku config:set ADMIN_CHAT_ID=chat_id1,chat_id2
 ```
 
 ## Development
