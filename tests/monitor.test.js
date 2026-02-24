@@ -3,7 +3,7 @@ const BotMonitor = require('../src/monitor');
 // Mock configuration
 const mockConfig = {
   TELEGRAM_BOT_TOKEN: '123456789:TEST_TOKEN',
-  ADMIN_CHAT_ID: '123456789',
+  ADMIN_CHAT_IDS: ['123456789', '987654321'],
   AUTH_TOKEN: 'test-token',
   MISSING_HEARTBEAT_THRESHOLD: 6,
   CRITICAL_ALERT_THROTTLE: 5,
@@ -236,26 +236,63 @@ describe('BotMonitor', () => {
   });
 
   describe('sendAlert', () => {
-    test('should send alert successfully', async () => {
+    test('should send alert to all chat IDs', async () => {
       const mockSendMessage = jest.fn().mockResolvedValue({});
       monitor.alertBot.sendMessage = mockSendMessage;
 
       const result = await monitor.sendAlert('Test alert');
 
-      expect(mockSendMessage).toHaveBeenCalledWith(
-        mockConfig.ADMIN_CHAT_ID,
-        'Test alert'
-      );
+      expect(mockSendMessage).toHaveBeenCalledTimes(2);
+      expect(mockSendMessage).toHaveBeenCalledWith('123456789', 'Test alert');
+      expect(mockSendMessage).toHaveBeenCalledWith('987654321', 'Test alert');
       expect(result).toBe(true);
     });
 
-    test('should handle send alert failure', async () => {
+    test('should return true if at least one delivery succeeds', async () => {
+      const mockSendMessage = jest.fn()
+        .mockRejectedValueOnce(new Error('Network error'))
+        .mockResolvedValueOnce({});
+      monitor.alertBot.sendMessage = mockSendMessage;
+
+      const result = await monitor.sendAlert('Test alert');
+
+      expect(result).toBe(true);
+    });
+
+    test('should return false if all deliveries fail', async () => {
       const mockSendMessage = jest.fn().mockRejectedValue(new Error('Network error'));
       monitor.alertBot.sendMessage = mockSendMessage;
 
       const result = await monitor.sendAlert('Test alert');
 
       expect(result).toBe(false);
+    }, 30000);
+  });
+
+  describe('checkCriticalIssues - alert aggregation', () => {
+    test('should aggregate multiple critical alerts into a single message', async () => {
+      const mockSendMessage = jest.fn().mockResolvedValue({});
+      monitor.alertBot.sendMessage = mockSendMessage;
+
+      const unhealthyMetrics = {
+        bot: 'lnp2pBot',
+        timestamp: Date.now(),
+        uptime: 3600,
+        memory: { rss: 134217728 },
+        processId: 1234,
+        dbConnected: false,
+        dbState: 'disconnected',
+        lightningConnected: false,
+        lastError: 'Connection refused',
+      };
+
+      await monitor.checkCriticalIssues(unhealthyMetrics);
+
+      // Should send ONE aggregated message per chat ID, not separate ones
+      expect(mockSendMessage).toHaveBeenCalledTimes(2); // 2 chat IDs
+      const sentMessage = mockSendMessage.mock.calls[0][1];
+      expect(sentMessage).toContain('MongoDB disconnected');
+      expect(sentMessage).toContain('Lightning node disconnected');
     });
   });
 
@@ -271,7 +308,7 @@ describe('BotMonitor', () => {
 
       expect(mockGetMe).toHaveBeenCalled();
       expect(mockSendMessage).toHaveBeenCalledWith(
-        mockConfig.ADMIN_CHAT_ID,
+        '123456789',
         expect.stringContaining('Test alert')
       );
       expect(result).toBe(true);

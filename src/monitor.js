@@ -135,17 +135,32 @@ class BotMonitor {
       });
     }
     
-    // Send alerts with spam protection
+    // Aggregate alerts that pass throttling into a single message
+    const alertsToSend = [];
     for (const alert of alerts) {
-      await this.sendAlertWithThrottling(alert);
+      if (this.shouldSendAlert(alert)) {
+        alertsToSend.push(alert);
+      }
+    }
+
+    if (alertsToSend.length > 0) {
+      const aggregatedMessage = alertsToSend.map(a => a.message).join('\n\n');
+      const success = await this.sendAlert(aggregatedMessage);
+      if (success) {
+        const now = Date.now();
+        for (const alert of alertsToSend) {
+          this.alertHistory.set(alert.key, now);
+        }
+      }
     }
   }
 
   /**
-   * Send an alert with throttling to prevent spam
+   * Check if an alert should be sent based on throttling rules
    * @param {object} alert - Alert object with level, message, and key
+   * @returns {boolean} Whether the alert should be sent
    */
-  async sendAlertWithThrottling(alert) {
+  shouldSendAlert(alert) {
     const now = Date.now();
     const lastSent = this.alertHistory.get(alert.key) || 0;
     
@@ -166,47 +181,62 @@ class BotMonitor {
     }
     
     if (now - lastSent > throttleTime) {
+      return true;
+    }
+    
+    const nextAllowedTime = new Date(lastSent + throttleTime);
+    logger.debug('Alert throttled', {
+      key: alert.key,
+      level: alert.level,
+      nextAllowedTime: nextAllowedTime.toISOString(),
+    });
+    return false;
+  }
+
+  /**
+   * Send an alert with throttling to prevent spam (legacy wrapper)
+   * @param {object} alert - Alert object with level, message, and key
+   */
+  async sendAlertWithThrottling(alert) {
+    if (this.shouldSendAlert(alert)) {
       const success = await this.sendAlert(alert.message);
       if (success) {
-        this.alertHistory.set(alert.key, now);
+        this.alertHistory.set(alert.key, Date.now());
       }
-    } else {
-      const nextAllowedTime = new Date(lastSent + throttleTime);
-      logger.debug('Alert throttled', {
-        key: alert.key,
-        level: alert.level,
-        nextAllowedTime: nextAllowedTime.toISOString(),
-      });
     }
   }
 
   /**
-   * Send alert to Telegram
+   * Send alert to all configured Telegram chat IDs
    * @param {string} message - Alert message
-   * @returns {boolean} Success status
+   * @returns {boolean} Success status (true if at least one delivery succeeded)
    */
   async sendAlert(message) {
-    try {
-      await retryWithBackoff(async () => {
-        await this.alertBot.sendMessage(this.config.ADMIN_CHAT_ID, message);
-      }, 3, 1000);
-      
-      logger.info('Alert sent successfully', {
-        message: message.substring(0, 100) + (message.length > 100 ? '...' : ''),
-        chatId: this.config.ADMIN_CHAT_ID,
-      });
-      
-      return true;
-    } catch (error) {
-      logger.error('Failed to send alert', {
-        error: error.message,
-        message: message.substring(0, 100) + (message.length > 100 ? '...' : ''),
-        chatId: this.config.ADMIN_CHAT_ID,
-        stack: error.stack,
-      });
-      
-      return false;
+    const chatIds = this.config.ADMIN_CHAT_IDS;
+    let anySuccess = false;
+
+    for (const chatId of chatIds) {
+      try {
+        await retryWithBackoff(async () => {
+          await this.alertBot.sendMessage(chatId, message);
+        }, 3, 1000);
+        
+        logger.info('Alert sent successfully', {
+          message: message.substring(0, 100) + (message.length > 100 ? '...' : ''),
+          chatId,
+        });
+        anySuccess = true;
+      } catch (error) {
+        logger.error('Failed to send alert', {
+          error: error.message,
+          message: message.substring(0, 100) + (message.length > 100 ? '...' : ''),
+          chatId,
+          stack: error.stack,
+        });
+      }
     }
+    
+    return anySuccess;
   }
 
   /**
