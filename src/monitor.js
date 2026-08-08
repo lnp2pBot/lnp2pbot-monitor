@@ -392,6 +392,9 @@ class BotMonitor {
         });
       });
     }, 60 * 1000);
+    // The timer must not keep the process alive on its own (e.g. after the
+    // HTTP server closes in tests); the server is what holds the process up.
+    checkInterval.unref();
 
     // Cleanup interval on process exit
     process.on('SIGTERM', () => clearInterval(checkInterval));
