@@ -9,6 +9,18 @@ afterAll((done) => {
   server.close(done);
 });
 
+describe('server port selection', () => {
+  test('PORT=0 binds a real ephemeral port, not the 3000 default', () => {
+    // parseInt('0') is falsy, so a `parseInt(...) || 3000` default silently
+    // turns the ephemeral-port request into port 3000 — and this suite would
+    // collide with any dev server (the process would die via the
+    // uncaughtException handler on EADDRINUSE).
+    const address = server.address();
+    expect(address.port).toBeGreaterThan(0);
+    expect(address.port).not.toBe(3000);
+  });
+});
+
 describe('server behind App Platform proxy', () => {
   test('trusts exactly one proxy hop so req.ip is the real client', () => {
     // App Platform terminates TLS and forwards with X-Forwarded-For. Without
