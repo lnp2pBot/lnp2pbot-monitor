@@ -4,6 +4,15 @@ const { logger } = require('./utils');
 
 const PAGE_SIZE = 250;
 const ALERT_RETENTION_DAYS = 90;
+// State lives in the bot's MongoDB (survives ephemeral filesystems and
+// redeploys); the JSON file is kept as a fallback for read-only credentials.
+const STATE_COLLECTION = 'monitor_reconciliation_state';
+const STATE_DOC_ID = 'reconciliation';
+// Stop paginating once a whole page predates the baseline by this margin.
+// The margin covers payments created before the baseline that settle after
+// it: without a cutoff the first pass walks the node's entire payment
+// history and can exhaust memory on small instances.
+const BASELINE_CUTOFF_MARGIN_MS = 24 * 60 * 60 * 1000;
 // Alert the admins after this many consecutive failed passes, at most once
 // per throttle window. With the default 10-minute interval the first alert
 // fires after ~30 minutes without reconciliation.
@@ -41,6 +50,7 @@ class PaymentReconciler {
     this.lndGetPayments = deps.getPayments || null;
     this.lndGetInvoice = deps.getInvoice || null;
     this.mongoClient = null;
+    this.remoteStateAvailable = false;
     this.isRunning = false;
     this.intervalHandle = null;
     this.lastError = null;
@@ -52,37 +62,45 @@ class PaymentReconciler {
     this.state = this.loadState();
   }
 
+  /**
+   * Validate and merge a raw state object (file or mongo) over defaults
+   * @returns {object|null} Normalized state, or null if unusable
+   */
+  normalizeState(parsed) {
+    const defaults = { baselineAt: null, lastIndex: 0, alerted: {} };
+    if (!parsed || typeof parsed !== 'object') return null;
+    // A hand-edited or corrupt baselineAt would parse to NaN and silently
+    // disable the baseline filter (every comparison against NaN is false),
+    // making the first pass classify the full payment history. Drop it and
+    // let run() set a fresh baseline instead.
+    let baselineAt = parsed.baselineAt || null;
+    if (baselineAt && isNaN(new Date(baselineAt).getTime())) {
+      logger.warn('Ignoring invalid baselineAt in reconciliation state', {
+        baselineAt,
+      });
+      baselineAt = null;
+    }
+    // Merge over defaults: a hand-edited or older-format record must not
+    // leave fields like `alerted` undefined and crash every pass.
+    return {
+      ...defaults,
+      ...parsed,
+      baselineAt,
+      lastIndex: Number(parsed.lastIndex) || 0,
+      alerted:
+        parsed.alerted && typeof parsed.alerted === 'object'
+          ? parsed.alerted
+          : {},
+    };
+  }
+
   loadState() {
     const defaults = { baselineAt: null, lastIndex: 0, alerted: {} };
     try {
       if (fs.existsSync(this.statePath)) {
         const parsed = JSON.parse(fs.readFileSync(this.statePath, 'utf8'));
-        if (parsed && typeof parsed === 'object') {
-          // A hand-edited or corrupt baselineAt would parse to NaN and
-          // silently disable the baseline filter (every comparison against
-          // NaN is false), making the first pass classify the full payment
-          // history. Drop it and let run() set a fresh baseline instead.
-          let baselineAt = parsed.baselineAt || null;
-          if (baselineAt && isNaN(new Date(baselineAt).getTime())) {
-            logger.warn('Ignoring invalid baselineAt in reconciliation state', {
-              baselineAt,
-              statePath: this.statePath,
-            });
-            baselineAt = null;
-          }
-          // Merge over defaults: a hand-edited or older-format file must not
-          // leave fields like `alerted` undefined and crash every pass.
-          return {
-            ...defaults,
-            ...parsed,
-            baselineAt,
-            lastIndex: Number(parsed.lastIndex) || 0,
-            alerted:
-              parsed.alerted && typeof parsed.alerted === 'object'
-                ? parsed.alerted
-                : {},
-          };
-        }
+        const normalized = this.normalizeState(parsed);
+        if (normalized) return normalized;
       }
     } catch (error) {
       logger.error('Failed to load reconciliation state, starting fresh', {
@@ -93,17 +111,78 @@ class PaymentReconciler {
     return defaults;
   }
 
-  saveState() {
+  /**
+   * Adopt the state stored in MongoDB. The local file lives on an ephemeral
+   * filesystem on PaaS deploys, so the database copy is authoritative —
+   * unless the file has a higher checkpoint (e.g. mongo writes were down for
+   * a while); then the file wins. Alert history is merged either way so a
+   * payment is never re-alerted.
+   */
+  async loadRemoteState() {
+    try {
+      const doc = await this.db
+        .collection(STATE_COLLECTION)
+        .findOne({ _id: STATE_DOC_ID });
+      this.remoteStateAvailable = true;
+      // Drop Mongo bookkeeping fields so they never leak into this.state
+      // (and from there back into the JSON file).
+      const stateFields = doc ? { ...doc } : null;
+      if (stateFields) {
+        delete stateFields._id;
+        delete stateFields.updatedAt;
+      }
+      const remote = this.normalizeState(stateFields);
+      if (!remote) return;
+      const local = this.state;
+      const chosen = remote.lastIndex >= local.lastIndex ? remote : local;
+      this.state = {
+        ...chosen,
+        baselineAt: chosen.baselineAt || remote.baselineAt || local.baselineAt,
+        alerted: { ...local.alerted, ...remote.alerted },
+      };
+      logger.info('Reconciliation state loaded from MongoDB', {
+        lastIndex: this.state.lastIndex,
+        baselineAt: this.state.baselineAt,
+      });
+    } catch (error) {
+      this.remoteStateAvailable = false;
+      logger.warn(
+        'Reconciliation state not readable from MongoDB, using file only',
+        { error: error.message }
+      );
+    }
+  }
+
+  async saveState() {
     try {
       fs.mkdirSync(path.dirname(this.statePath), { recursive: true });
       const tmpPath = this.statePath + '.tmp';
       fs.writeFileSync(tmpPath, JSON.stringify(this.state, null, 2));
       fs.renameSync(tmpPath, this.statePath);
     } catch (error) {
-      logger.error('Failed to save reconciliation state', {
+      logger.error('Failed to save reconciliation state file', {
         error: error.message,
         statePath: this.statePath,
       });
+    }
+
+    if (!this.remoteStateAvailable) return;
+    try {
+      await this.db
+        .collection(STATE_COLLECTION)
+        .updateOne(
+          { _id: STATE_DOC_ID },
+          { $set: { ...this.state, updatedAt: new Date() } },
+          { upsert: true }
+        );
+    } catch (error) {
+      // Read-only credentials land here on the first save: keep running on
+      // the file fallback and stop retrying until the next restart.
+      this.remoteStateAvailable = false;
+      logger.error(
+        'Failed to save reconciliation state to MongoDB, using file only',
+        { error: error.message }
+      );
     }
   }
 
@@ -118,6 +197,7 @@ class PaymentReconciler {
       this.db = this.mongoClient.db(); // db name comes from the URI
       logger.info('Reconciliation: connected to MongoDB');
     }
+    await this.loadRemoteState();
 
     if (!this.lndGetPayments || !this.lndGetInvoice) {
       const {
@@ -149,7 +229,9 @@ class PaymentReconciler {
   }
 
   /**
-   * Fetch settled outgoing payments with index greater than state.lastIndex
+   * Stream settled outgoing payments with index greater than state.lastIndex
+   * to the handler, one page at a time. Payments are never accumulated: a
+   * first pass over a node with years of history must run in constant memory.
    *
    * Pagination contract (LND ListPayments via the `lightning` library):
    * - The library always queries with `reversed: true`, i.e. BACKWARDS
@@ -162,10 +244,11 @@ class PaymentReconciler {
    *   returned. In-flight payments are not listed at all and simply show up
    *   in a later pass once they settle; failed payments never moved money.
    *
-   * @returns {Promise<Array>} New payments, newest first (as LND returns them)
+   * @param {function} handler - async (payment) => void, newest first
+   * @param {number} cutoffMs - stop paging when a whole page resolved before
+   *   this epoch-ms timestamp (0 disables the cutoff)
    */
-  async fetchNewPayments() {
-    const payments = [];
+  async forEachNewPayment(handler, cutoffMs) {
     let token; // start tokenless: the newest page
 
     for (;;) {
@@ -176,18 +259,26 @@ class PaymentReconciler {
       // Pages walk backwards through history: once a page contains a payment
       // at or below the checkpoint, every further page is older still.
       let reachedCheckpoint = false;
+      let newestResolvedAt = 0;
       for (const payment of page) {
         if (payment.index > this.state.lastIndex) {
-          payments.push(payment);
+          await handler(payment);
         } else {
           reachedCheckpoint = true;
         }
+        const resolvedAt = new Date(
+          payment.confirmed_at || payment.created_at
+        ).getTime();
+        if (resolvedAt > newestResolvedAt) newestResolvedAt = resolvedAt;
       }
 
       if (reachedCheckpoint || !res.next || page.length === 0) break;
+      // Baseline cutoff: when even the newest payment of this page resolved
+      // before the cutoff, deeper (older) pages cannot contain anything
+      // classifiable — stop instead of walking the full history.
+      if (cutoffMs && newestResolvedAt && newestResolvedAt < cutoffMs) break;
       token = res.next;
     }
-    return payments;
   }
 
   /**
@@ -356,66 +447,84 @@ class PaymentReconciler {
       }
       const baseline = new Date(this.state.baselineAt).getTime();
 
-      const payments = await this.fetchNewPayments();
-      let alerts = 0;
-      let scanned = 0;
       // Defense in depth: the LND call only returns settled payments
       // (include_incomplete stays false), but keep the unconfirmed guard so
       // that a payment observed in flight can never move the checkpoint past
       // itself. The same protection covers payments whose alert delivery
       // failed: they stay at or below the checkpoint and are retried.
-      let highestSeen = this.state.lastIndex;
-      let lowestUnresolved = Infinity;
+      const pass = {
+        baseline,
+        newPayments: 0,
+        scanned: 0,
+        alerts: 0,
+        highestSeen: this.state.lastIndex,
+        lowestUnresolved: Infinity,
+      };
 
-      for (const payment of payments) {
-        if (payment.index > highestSeen) highestSeen = payment.index;
-        if (!payment.is_confirmed) {
-          lowestUnresolved = Math.min(lowestUnresolved, payment.index);
-          continue;
-        }
-        const confirmedAt = new Date(
-          payment.confirmed_at || payment.created_at
-        ).getTime();
-        if (confirmedAt < baseline) continue;
-        if (this.state.alerted[payment.id]) continue;
+      await this.forEachNewPayment(
+        (payment) => this.processPayment(payment, pass),
+        baseline - BASELINE_CUTOFF_MARGIN_MS
+      );
 
-        scanned++;
-        const result = await this.classifyPayment(payment);
-        if (result.verdict === 'alert') {
-          alerts++;
-          logger.error('Reconciliation: suspicious outgoing payment', {
-            hash: payment.id,
-            tokens: payment.tokens,
-            destination: payment.destination,
-            reason: result.reason,
-            problems: result.problems,
-          });
-          const sent = await this.sendAlert(
-            this.buildAlertMessage(payment, result)
-          );
-          if (sent) this.state.alerted[payment.id] = Date.now();
-          else lowestUnresolved = Math.min(lowestUnresolved, payment.index);
-        } else {
-          logger.info('Reconciliation: payment verified', {
-            hash: payment.id,
-            tokens: payment.tokens,
-            reason: result.reason,
-          });
-        }
-      }
-
-      this.state.lastIndex = Math.min(highestSeen, lowestUnresolved - 1);
+      this.state.lastIndex = Math.min(
+        pass.highestSeen,
+        pass.lowestUnresolved - 1
+      );
       this.pruneAlertHistory();
-      this.saveState();
+      await this.saveState();
       logger.info('Reconciliation pass finished', {
-        newPayments: payments.length,
-        scanned,
-        alerts,
+        newPayments: pass.newPayments,
+        scanned: pass.scanned,
+        alerts: pass.alerts,
         lastIndex: this.state.lastIndex,
       });
-      return { scanned, alerts };
+      return { scanned: pass.scanned, alerts: pass.alerts };
     } finally {
       this.isRunning = false;
+    }
+  }
+
+  /**
+   * Classify a single streamed payment and update the pass counters
+   * @param {object} payment - LND payment
+   * @param {object} pass - Mutable per-pass counters (see run())
+   */
+  async processPayment(payment, pass) {
+    pass.newPayments++;
+    if (payment.index > pass.highestSeen) pass.highestSeen = payment.index;
+    if (!payment.is_confirmed) {
+      pass.lowestUnresolved = Math.min(pass.lowestUnresolved, payment.index);
+      return;
+    }
+    const confirmedAt = new Date(
+      payment.confirmed_at || payment.created_at
+    ).getTime();
+    if (confirmedAt < pass.baseline) return;
+    if (this.state.alerted[payment.id]) return;
+
+    pass.scanned++;
+    const result = await this.classifyPayment(payment);
+    if (result.verdict === 'alert') {
+      pass.alerts++;
+      logger.error('Reconciliation: suspicious outgoing payment', {
+        hash: payment.id,
+        tokens: payment.tokens,
+        destination: payment.destination,
+        reason: result.reason,
+        problems: result.problems,
+      });
+      const sent = await this.sendAlert(
+        this.buildAlertMessage(payment, result)
+      );
+      if (sent) this.state.alerted[payment.id] = Date.now();
+      else
+        pass.lowestUnresolved = Math.min(pass.lowestUnresolved, payment.index);
+    } else {
+      logger.info('Reconciliation: payment verified', {
+        hash: payment.id,
+        tokens: payment.tokens,
+        reason: result.reason,
+      });
     }
   }
 
@@ -492,6 +601,7 @@ class PaymentReconciler {
       lastPaymentIndex: this.state.lastIndex,
       alertedPayments: Object.keys(this.state.alerted).length,
       isRunning: this.isRunning,
+      stateStorage: this.remoteStateAvailable ? 'mongodb' : 'file',
       lastError: this.lastError,
       consecutivePassFailures: this.consecutivePassFailures,
     };

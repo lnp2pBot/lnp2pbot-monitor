@@ -45,23 +45,27 @@ This service is part of the **lnp2pBot Health Monitoring System** described in [
 ### Local Development
 
 1. **Clone the repository:**
+
    ```bash
    git clone https://github.com/lnp2pBot/lnp2pbot-monitor.git
    cd lnp2pbot-monitor
    ```
 
 2. **Install dependencies:**
+
    ```bash
    npm install
    ```
 
 3. **Configure environment:**
+
    ```bash
    cp .env.example .env
    # Edit .env with your configuration
    ```
 
 4. **Start the service:**
+
    ```bash
    npm start
    ```
@@ -77,16 +81,16 @@ This service is part of the **lnp2pBot Health Monitoring System** described in [
 
 ### Environment Variables
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `PORT` | No | `3000` | Server port |
-| `TELEGRAM_BOT_TOKEN` | Yes | - | Bot token for sending alerts |
-| `ADMIN_CHAT_ID` | Yes | - | Comma-separated list of Telegram chat IDs for alerts |
-| `AUTH_TOKEN` | No | - | Optional authentication token |
-| `MISSING_HEARTBEAT_THRESHOLD` | No | `6` | Minutes before missing heartbeat alert |
-| `CRITICAL_ALERT_THROTTLE` | No | `5` | Minutes between critical alerts |
-| `WARNING_ALERT_THROTTLE` | No | `30` | Minutes between warning alerts |
-| `LOG_LEVEL` | No | `info` | Logging level (error, warn, info, debug) |
+| Variable                      | Required | Default | Description                                          |
+| ----------------------------- | -------- | ------- | ---------------------------------------------------- |
+| `PORT`                        | No       | `3000`  | Server port                                          |
+| `TELEGRAM_BOT_TOKEN`          | Yes      | -       | Bot token for sending alerts                         |
+| `ADMIN_CHAT_ID`               | Yes      | -       | Comma-separated list of Telegram chat IDs for alerts |
+| `AUTH_TOKEN`                  | No       | -       | Optional authentication token                        |
+| `MISSING_HEARTBEAT_THRESHOLD` | No       | `6`     | Minutes before missing heartbeat alert               |
+| `CRITICAL_ALERT_THROTTLE`     | No       | `5`     | Minutes between critical alerts                      |
+| `WARNING_ALERT_THROTTLE`      | No       | `30`    | Minutes between warning alerts                       |
+| `LOG_LEVEL`                   | No       | `info`  | Logging level (error, warn, info, debug)             |
 
 ### Example Configuration
 
@@ -135,11 +139,13 @@ The service receives and analyzes comprehensive health data from lnp2pBot:
 ### Intelligent Alerting
 
 #### Critical Alerts (5min throttling)
+
 - 🚨 **MongoDB disconnected**
 - 🚨 **Lightning node disconnected**
 - 🚨 **Bot missing heartbeats (6+ minutes)**
 
 #### Warning Alerts (30min throttling)
+
 - ⚠️ **Lightning node not synced to chain**
 - ⚠️ **Lightning node not synced to graph**
 - ⚠️ **No active Lightning channels**
@@ -167,8 +173,15 @@ original hold invoice.
 
 Any settled outgoing payment that fails these checks triggers a critical
 Telegram alert including the amount, destination pubkey, payment hash,
-invoice, and timestamps. Each payment hash is alerted only once (state is
-persisted in `data/reconciliation-state.json`).
+invoice, and timestamps. Each payment hash is alerted only once. State
+(baseline, checkpoint, alert history) is persisted in the bot's MongoDB
+(`monitor_reconciliation_state` collection) so it survives redeploys and
+ephemeral filesystems; `data/reconciliation-state.json` is kept as a local
+fallback when the Mongo credentials are read-only.
+
+Payments are classified page by page as they stream from LND, and pagination
+stops once a page is entirely older than the baseline — the first pass never
+loads the node's full payment history into memory.
 
 The reconciler also watches itself: if it cannot start (MongoDB or LND
 unreachable) it retries every 5 minutes and alerts the admins (throttled to
@@ -194,6 +207,7 @@ reconciliation status at `GET /api/reconciliation`.
 Access the status dashboard at: `http://your-monitor-url/`
 
 Example response:
+
 ```json
 {
   "status": "✅ Healthy",
@@ -218,6 +232,7 @@ Example response:
 Receives health data from lnp2pBot.
 
 **Headers:**
+
 - `Content-Type: application/json`
 - `Authorization: Bearer <token>` (if `AUTH_TOKEN` is configured)
 
@@ -260,6 +275,7 @@ This service is designed for easy deployment on Digital Ocean App Platform.
    - Set environment variables (see Configuration section)
 
 3. **Environment Variables** in DO App Platform:
+
    ```
    TELEGRAM_BOT_TOKEN=your_bot_token
    ADMIN_CHAT_ID=chat_id1,chat_id2
@@ -270,15 +286,15 @@ This service is designed for easy deployment on Digital Ocean App Platform.
    ```yaml
    name: lnp2pbot-monitor
    services:
-   - name: web
-     source_dir: /
-     github:
-       repo: your-username/lnp2pbot-monitor
-       branch: main
-     run_command: npm start
-     environment_slug: node-js
-     instance_count: 1
-     instance_size_slug: basic-xxs
+     - name: web
+       source_dir: /
+       github:
+         repo: your-username/lnp2pbot-monitor
+         branch: main
+       run_command: npm start
+       environment_slug: node-js
+       instance_count: 1
+       instance_size_slug: basic-xxs
    ```
 
 **Cost:** ~$5/month for basic monitoring
@@ -390,6 +406,7 @@ curl https://your-monitor-url/health
 #### Bot not sending heartbeats
 
 1. Check bot configuration:
+
    ```bash
    # In bot .env
    MONITOR_HEARTBEAT_URL=https://your-monitor-url
@@ -412,6 +429,7 @@ curl https://your-monitor-url/health
 #### High memory usage alerts
 
 Increase memory threshold in `src/monitor.js`:
+
 ```javascript
 if (metrics.memory.rss > 2048 * 1024 * 1024) { // 2GB instead of 1GB
 ```

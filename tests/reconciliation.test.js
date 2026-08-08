@@ -50,10 +50,17 @@ const makeOrder = (overrides = {}) => ({
 });
 
 /**
- * Minimal in-memory stand-in for the two Mongo collections the reconciler
- * queries. Each collection gets a findOne(query) resolved against fixtures.
+ * Minimal in-memory stand-in for the Mongo collections the reconciler uses.
+ * Order/pending collections get a findOne(query) resolved against fixtures;
+ * the monitor's own state collection also supports updateOne upserts so the
+ * MongoDB state persistence path can be exercised.
  */
-const makeDb = ({ orders = [], pendingPayments = [] } = {}) => {
+const makeDb = ({
+  orders = [],
+  pendingPayments = [],
+  stateDocs = {},
+  failStateWrites = false,
+} = {}) => {
   const matches = (doc, query) => {
     for (const [key, value] of Object.entries(query)) {
       if (key === '$or') {
@@ -75,10 +82,22 @@ const makeDb = ({ orders = [], pendingPayments = [] } = {}) => {
     pendingpayments: pendingPayments,
   };
   return {
-    collection: (name) => ({
-      findOne: async (query) =>
-        (collections[name] || []).find((doc) => matches(doc, query)) || null,
-    }),
+    stateDocs,
+    collection: (name) => {
+      if (name === 'monitor_reconciliation_state') {
+        return {
+          findOne: async (query) => stateDocs[query._id] || null,
+          updateOne: async (query, update) => {
+            if (failStateWrites) throw new Error('not authorized on db');
+            stateDocs[query._id] = { _id: query._id, ...update.$set };
+          },
+        };
+      }
+      return {
+        findOne: async (query) =>
+          (collections[name] || []).find((doc) => matches(doc, query)) || null,
+      };
+    },
   };
 };
 
@@ -395,7 +414,7 @@ describe('PaymentReconciler.run', () => {
   });
 });
 
-describe('PaymentReconciler.fetchNewPayments', () => {
+describe('PaymentReconciler.forEachNewPayment', () => {
   test('sees payments newer than the checkpoint (LND paginates backwards)', async () => {
     // Regression test: LND's listPayments is always backwards — a tokenless
     // call returns the NEWEST page and `next` walks further back. The old
@@ -416,13 +435,198 @@ describe('PaymentReconciler.fetchNewPayments', () => {
     });
     reconciler.state.lastIndex = 10;
 
-    const payments = await reconciler.fetchNewPayments();
+    const seen = [];
+    await reconciler.forEachNewPayment(async (p) => seen.push(p.index), 0);
 
-    expect(payments.map((p) => p.index)).toEqual([12, 11]);
+    expect(seen).toEqual([12, 11]);
     // First request must be tokenless, and paging must stop as soon as a
     // page reaches the checkpoint (no full-history scan per pass).
     expect(getPayments).toHaveBeenCalledTimes(2);
     expect(getPayments.mock.calls[0][0]).toEqual({ limit: 250 });
+  });
+
+  test('classifies payments across multiple pages in a single pass', async () => {
+    // Payments must be processed page by page (streaming), never accumulated
+    // into one array: a first pass over a node with years of history must
+    // run in constant memory.
+    const onPageOne = makePayment({ id: ROGUE_HASH, index: 22 });
+    const onPageTwo = makePayment({ id: 'e'.repeat(64), index: 21 });
+    const getPayments = jest.fn(async ({ token }) => {
+      if (!token) return { payments: [onPageOne], next: 'older-page' };
+      return { payments: [onPageTwo], next: null };
+    });
+    const sendAlert = jest.fn().mockResolvedValue(true);
+    const reconciler = new PaymentReconciler(baseConfig(), sendAlert, {
+      db: makeDb(),
+      getPayments,
+      getInvoice: jest.fn(),
+    });
+
+    const { scanned, alerts } = await reconciler.run();
+
+    expect(scanned).toBe(2);
+    expect(alerts).toBe(2);
+    expect(reconciler.state.lastIndex).toBe(22);
+    // The page-one payment must be classified BEFORE page two is fetched:
+    // that is what keeps memory constant on a long first pass.
+    const firstAlertOrder = sendAlert.mock.invocationCallOrder[0];
+    const secondFetchOrder = getPayments.mock.invocationCallOrder[1];
+    expect(firstAlertOrder).toBeLessThan(secondFetchOrder);
+  });
+
+  test('stops paginating once a full page predates the baseline', async () => {
+    // Pages walk backwards in time: when even the newest payment of a page
+    // is older than the baseline (minus the in-flight margin), every deeper
+    // page is older still and cannot contain anything classifiable. Without
+    // this cutoff the first pass walks the node's entire payment history.
+    const recent = makePayment({ id: ROGUE_HASH, index: 30 });
+    const ancient = makePayment({
+      id: 'e'.repeat(64),
+      index: 20,
+      confirmed_at: '2020-01-01T00:00:00.000Z',
+      created_at: '2020-01-01T00:00:00.000Z',
+    });
+    const getPayments = jest.fn(async ({ token }) => {
+      if (!token) return { payments: [recent], next: 'page-2' };
+      if (token === 'page-2') return { payments: [ancient], next: 'page-3' };
+      throw new Error('paginated past the baseline cutoff');
+    });
+    const sendAlert = jest.fn().mockResolvedValue(true);
+    const reconciler = new PaymentReconciler(baseConfig(), sendAlert, {
+      db: makeDb(),
+      getPayments,
+      getInvoice: jest.fn(),
+    });
+
+    const { scanned, alerts } = await reconciler.run();
+
+    expect(getPayments).toHaveBeenCalledTimes(2);
+    expect(scanned).toBe(1);
+    expect(alerts).toBe(1);
+    expect(reconciler.state.lastIndex).toBe(30);
+  });
+});
+
+describe('PaymentReconciler state persistence in MongoDB', () => {
+  const emptyLnd = () => ({
+    getPayments: jest.fn().mockResolvedValue({ payments: [], next: null }),
+    getInvoice: jest.fn(),
+  });
+
+  test('connect() adopts the state stored in mongo over the local file', async () => {
+    const stateDocs = {
+      reconciliation: {
+        _id: 'reconciliation',
+        baselineAt: '2026-07-01T00:00:00.000Z',
+        lastIndex: 99,
+        alerted: { [ROGUE_HASH]: 1751328000000 },
+      },
+    };
+    const reconciler = new PaymentReconciler(baseConfig(), jest.fn(), {
+      db: makeDb({ stateDocs }),
+      ...emptyLnd(),
+    });
+
+    await reconciler.connect();
+
+    expect(reconciler.state.lastIndex).toBe(99);
+    expect(reconciler.state.baselineAt).toBe('2026-07-01T00:00:00.000Z');
+    expect(reconciler.state.alerted[ROGUE_HASH]).toBeDefined();
+  });
+
+  test('a pass upserts the state to mongo so it survives ephemeral filesystems', async () => {
+    const stateDocs = {};
+    const payment = makePayment({ id: ROGUE_HASH, index: 42 });
+    const sendAlert = jest.fn().mockResolvedValue(true);
+    const reconciler = new PaymentReconciler(baseConfig(), sendAlert, {
+      db: makeDb({ stateDocs }),
+      getPayments: jest.fn().mockResolvedValue({ payments: [payment] }),
+      getInvoice: jest.fn(),
+    });
+
+    await reconciler.connect();
+    await reconciler.run();
+
+    expect(stateDocs.reconciliation).toBeDefined();
+    expect(stateDocs.reconciliation.lastIndex).toBe(42);
+    expect(stateDocs.reconciliation.alerted[ROGUE_HASH]).toBeDefined();
+
+    // Simulate an App Platform restart: fresh filesystem (new state file),
+    // same database. The checkpoint and alert history must be recovered.
+    const second = new PaymentReconciler(baseConfig(), jest.fn(), {
+      db: makeDb({ stateDocs }),
+      ...emptyLnd(),
+    });
+    await second.connect();
+
+    expect(second.state.lastIndex).toBe(42);
+    expect(second.state.baselineAt).toBe(reconciler.state.baselineAt);
+    expect(second.state.alerted[ROGUE_HASH]).toBeDefined();
+  });
+
+  test('keeps the file state when the mongo copy is older (stale remote)', async () => {
+    const config = baseConfig();
+    fs.writeFileSync(
+      config.RECONCILIATION_STATE_FILE,
+      JSON.stringify({
+        baselineAt: '2026-07-01T00:00:00.000Z',
+        lastIndex: 50,
+        alerted: {},
+      })
+    );
+    const stateDocs = {
+      reconciliation: {
+        _id: 'reconciliation',
+        baselineAt: '2026-07-01T00:00:00.000Z',
+        lastIndex: 10,
+        alerted: { [ROGUE_HASH]: 1751328000000 },
+      },
+    };
+    const reconciler = new PaymentReconciler(config, jest.fn(), {
+      db: makeDb({ stateDocs }),
+      ...emptyLnd(),
+    });
+
+    await reconciler.connect();
+
+    // The higher checkpoint wins, and alert history is merged so no payment
+    // is ever re-alerted.
+    expect(reconciler.state.lastIndex).toBe(50);
+    expect(reconciler.state.alerted[ROGUE_HASH]).toBeDefined();
+  });
+
+  test('getStatus reports where the state is persisted', async () => {
+    const reconciler = new PaymentReconciler(baseConfig(), jest.fn(), {
+      db: makeDb(),
+      ...emptyLnd(),
+    });
+
+    expect(reconciler.getStatus().stateStorage).toBe('file');
+    await reconciler.connect();
+    expect(reconciler.getStatus().stateStorage).toBe('mongodb');
+
+    reconciler.stop();
+    expect(reconciler.intervalHandle).toBeNull();
+  });
+
+  test('falls back to file-only state when mongo writes are rejected', async () => {
+    const config = baseConfig();
+    const payment = makePayment({ id: ROGUE_HASH, index: 7 });
+    const sendAlert = jest.fn().mockResolvedValue(true);
+    const reconciler = new PaymentReconciler(config, sendAlert, {
+      db: makeDb({ failStateWrites: true }),
+      getPayments: jest.fn().mockResolvedValue({ payments: [payment] }),
+      getInvoice: jest.fn(),
+    });
+
+    await reconciler.connect();
+    await expect(reconciler.run()).resolves.toEqual({ scanned: 1, alerts: 1 });
+
+    // The file copy still works as fallback (read-only mongo credentials).
+    const onDisk = JSON.parse(
+      fs.readFileSync(config.RECONCILIATION_STATE_FILE, 'utf8')
+    );
+    expect(onDisk.lastIndex).toBe(7);
   });
 });
 
