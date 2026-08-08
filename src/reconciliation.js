@@ -21,6 +21,12 @@ const BASELINE_CUTOFF_MARGIN_MS = 14 * 24 * 60 * 60 * 1000;
 // MongoDB "Unauthorized": the credentials cannot write. Permanent, unlike
 // network blips or failovers which must be retried on the next pass.
 const MONGO_UNAUTHORIZED_CODE = 13;
+// A payment can settle on LND seconds before the bot persists its backing
+// record (payout_hash on the order): alerting immediately produces false
+// positives. An unmatched payment settled less than this long ago is
+// rechecked on later passes instead; a real theft still alerts, just this
+// much later.
+const UNMATCHED_ALERT_GRACE_MS = 10 * 60 * 1000;
 // Alert the admins after this many consecutive failed passes, at most once
 // per throttle window. With the default 10-minute interval the first alert
 // fires after ~30 minutes without reconciliation.
@@ -526,6 +532,17 @@ class PaymentReconciler {
     pass.scanned++;
     const result = await this.classifyPayment(payment);
     if (result.verdict === 'alert') {
+      if (Date.now() - confirmedAt < UNMATCHED_ALERT_GRACE_MS) {
+        // The bot may not have written the backing record yet (settlement
+        // races the DB write). Hold the checkpoint below this payment so the
+        // next pass re-classifies it; alert only once the grace expires.
+        pass.lowestUnresolved = Math.min(pass.lowestUnresolved, payment.index);
+        logger.info(
+          'Reconciliation: unmatched payment within grace period, rechecking next pass',
+          { hash: payment.id, tokens: payment.tokens, reason: result.reason }
+        );
+        return;
+      }
       pass.alerts++;
       logger.error('Reconciliation: suspicious outgoing payment', {
         hash: payment.id,
