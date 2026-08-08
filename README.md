@@ -173,10 +173,11 @@ original hold invoice.
 
 Any settled outgoing payment that fails these checks triggers a critical
 Telegram alert including the amount, destination pubkey, payment hash,
-invoice, and timestamps. Payments settled less than 10 minutes ago get a
-grace period first: LND can settle a payout seconds before the bot persists
-the backing record, so fresh unmatched payments are rechecked on later
-passes and only alerted once the grace expires. Each payment hash is alerted only once. State
+invoice, and timestamps. Unmatched payments are re-classified once after a
+60-second in-pass recheck before alerting: LND can settle a payout seconds
+before the bot persists the backing record, and the recheck absorbs that
+race without delaying real alerts — a theft alerts at most one interval
+plus 60 seconds after settling. Each payment hash is alerted only once. State
 (baseline, checkpoint, alert history) is persisted in the bot's MongoDB
 (`monitor_reconciliation_state` collection) so it survives redeploys and
 ephemeral filesystems; `data/reconciliation-state.json` is kept as a local
@@ -263,8 +264,11 @@ Payment reconciliation status.
 
 **Response:** `{"enabled": false}` when reconciliation is not configured,
 otherwise `{"enabled": true, "baselineAt": ..., "lastPaymentIndex": ...,
-"alertedPayments": ..., "isRunning": ..., "stateStorage": ...,
-"lastError": ...}` (`lastError` is `null` when the last pass succeeded;
+"alertedPayments": ..., "isRunning": ..., "lastPassAt": ...,
+"stateStorage": ..., "lastError": ...}` (`isRunning` is `true` only while
+a pass is executing — passes take seconds and run every
+`RECONCILIATION_INTERVAL` minutes; `lastPassAt` is when the last pass
+finished; `lastError` is `null` when the last pass succeeded;
 `stateStorage` is `"mongodb"` when state is persisted in the bot's database
 or `"file"` when running on the local JSON fallback).
 

@@ -22,11 +22,11 @@ const BASELINE_CUTOFF_MARGIN_MS = 14 * 24 * 60 * 60 * 1000;
 // network blips or failovers which must be retried on the next pass.
 const MONGO_UNAUTHORIZED_CODE = 13;
 // A payment can settle on LND seconds before the bot persists its backing
-// record (payout_hash on the order): alerting immediately produces false
-// positives. An unmatched payment settled less than this long ago is
-// rechecked on later passes instead; a real theft still alerts, just this
-// much later.
-const UNMATCHED_ALERT_GRACE_MS = 10 * 60 * 1000;
+// record (payout_hash on the order): alerting on the first look produces
+// false positives. Unmatched payments are re-classified once after this
+// delay, WITHIN the same pass — a real theft still alerts at most one
+// interval plus this delay after settling.
+const DEFAULT_RECHECK_DELAY_MS = 60 * 1000;
 // Alert the admins after this many consecutive failed passes, at most once
 // per throttle window. With the default 10-minute interval the first alert
 // fires after ~30 minutes without reconciliation.
@@ -66,6 +66,11 @@ class PaymentReconciler {
     this.mongoClient = null;
     this.remoteStateAvailable = false;
     this.isRunning = false;
+    this.lastPassAt = null;
+    this.recheckDelayMs =
+      config.RECONCILIATION_RECHECK_DELAY_MS ?? DEFAULT_RECHECK_DELAY_MS;
+    this.wait =
+      deps.wait || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.intervalHandle = null;
     this.lastError = null;
     this.consecutivePassFailures = 0;
@@ -486,6 +491,7 @@ class PaymentReconciler {
         alerts: 0,
         highestSeen: this.state.lastIndex,
         lowestUnresolved: Infinity,
+        recheck: [],
       };
 
       await this.forEachNewPayment(
@@ -493,12 +499,36 @@ class PaymentReconciler {
         baseline - BASELINE_CUTOFF_MARGIN_MS
       );
 
+      // Unmatched payments may have raced the bot's payout_hash write:
+      // give the write a moment to land, then re-classify within this same
+      // pass so a real theft is never delayed to a later interval.
+      if (pass.recheck.length > 0) {
+        logger.info('Reconciliation: rechecking unmatched payments', {
+          count: pass.recheck.length,
+          delayMs: this.recheckDelayMs,
+        });
+        await this.wait(this.recheckDelayMs);
+        for (const payment of pass.recheck) {
+          const result = await this.classifyPayment(payment);
+          if (result.verdict === 'alert') {
+            await this.alertSuspicious(payment, result, pass);
+          } else {
+            logger.info('Reconciliation: payment verified on recheck', {
+              hash: payment.id,
+              tokens: payment.tokens,
+              reason: result.reason,
+            });
+          }
+        }
+      }
+
       this.state.lastIndex = Math.min(
         pass.highestSeen,
         pass.lowestUnresolved - 1
       );
       this.pruneAlertHistory();
       await this.saveState();
+      this.lastPassAt = new Date().toISOString();
       logger.info('Reconciliation pass finished', {
         newPayments: pass.newPayments,
         scanned: pass.scanned,
@@ -532,37 +562,14 @@ class PaymentReconciler {
     pass.scanned++;
     const result = await this.classifyPayment(payment);
     if (result.verdict === 'alert') {
-      // The grace only covers the payout_hash write race, which produces
+      // The recheck only covers the payout_hash write race, which produces
       // `unmatched`. A matched order that fails verification is a stronger
       // signal and alerts immediately.
-      if (
-        result.reason === 'unmatched' &&
-        Date.now() - confirmedAt < UNMATCHED_ALERT_GRACE_MS
-      ) {
-        // The bot may not have written the backing record yet (settlement
-        // races the DB write). Hold the checkpoint below this payment so the
-        // next pass re-classifies it; alert only once the grace expires.
-        pass.lowestUnresolved = Math.min(pass.lowestUnresolved, payment.index);
-        logger.info(
-          'Reconciliation: unmatched payment within grace period, rechecking next pass',
-          { hash: payment.id, tokens: payment.tokens, reason: result.reason }
-        );
+      if (result.reason === 'unmatched') {
+        pass.recheck.push(payment);
         return;
       }
-      pass.alerts++;
-      logger.error('Reconciliation: suspicious outgoing payment', {
-        hash: payment.id,
-        tokens: payment.tokens,
-        destination: payment.destination,
-        reason: result.reason,
-        problems: result.problems,
-      });
-      const sent = await this.sendAlert(
-        this.buildAlertMessage(payment, result)
-      );
-      if (sent) this.state.alerted[payment.id] = Date.now();
-      else
-        pass.lowestUnresolved = Math.min(pass.lowestUnresolved, payment.index);
+      await this.alertSuspicious(payment, result, pass);
     } else {
       logger.info('Reconciliation: payment verified', {
         hash: payment.id,
@@ -570,6 +577,26 @@ class PaymentReconciler {
         reason: result.reason,
       });
     }
+  }
+
+  /**
+   * Send the alert for a confirmed-suspicious payment and record delivery
+   * @param {object} payment - LND payment
+   * @param {object} result - Classification result with verdict 'alert'
+   * @param {object} pass - Mutable per-pass counters (see run())
+   */
+  async alertSuspicious(payment, result, pass) {
+    pass.alerts++;
+    logger.error('Reconciliation: suspicious outgoing payment', {
+      hash: payment.id,
+      tokens: payment.tokens,
+      destination: payment.destination,
+      reason: result.reason,
+      problems: result.problems,
+    });
+    const sent = await this.sendAlert(this.buildAlertMessage(payment, result));
+    if (sent) this.state.alerted[payment.id] = Date.now();
+    else pass.lowestUnresolved = Math.min(pass.lowestUnresolved, payment.index);
   }
 
   /**
@@ -645,6 +672,7 @@ class PaymentReconciler {
       lastPaymentIndex: this.state.lastIndex,
       alertedPayments: Object.keys(this.state.alerted).length,
       isRunning: this.isRunning,
+      lastPassAt: this.lastPassAt,
       stateStorage: this.remoteStateAvailable ? 'mongodb' : 'file',
       lastError: this.lastError,
       consecutivePassFailures: this.consecutivePassFailures,
