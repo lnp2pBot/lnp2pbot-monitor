@@ -4,51 +4,85 @@ const config = {
   // Server configuration
   PORT: parseInt(process.env.PORT) || 3000,
   NODE_ENV: process.env.NODE_ENV || 'development',
-  
+
   // Telegram bot configuration (required)
   TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
   ADMIN_CHAT_IDS: process.env.ADMIN_CHAT_ID
-    ? process.env.ADMIN_CHAT_ID.split(',').map(id => id.trim()).filter(Boolean)
+    ? process.env.ADMIN_CHAT_ID.split(',')
+        .map((id) => id.trim())
+        .filter(Boolean)
     : [],
-  
+
   // Authentication (optional)
   AUTH_TOKEN: process.env.AUTH_TOKEN,
-  
+
   // Monitoring thresholds
-  MISSING_HEARTBEAT_THRESHOLD: parseInt(process.env.MISSING_HEARTBEAT_THRESHOLD) || 6, // minutes
+  MISSING_HEARTBEAT_THRESHOLD:
+    parseInt(process.env.MISSING_HEARTBEAT_THRESHOLD) || 6, // minutes
   CRITICAL_ALERT_THROTTLE: parseInt(process.env.CRITICAL_ALERT_THROTTLE) || 5, // minutes
   WARNING_ALERT_THROTTLE: parseInt(process.env.WARNING_ALERT_THROTTLE) || 30, // minutes
-  
+
   // Memory thresholds
   HIGH_MEMORY_THRESHOLD: parseInt(process.env.HIGH_MEMORY_THRESHOLD) || 1024, // MB
-  VERY_HIGH_MEMORY_THRESHOLD: parseInt(process.env.VERY_HIGH_MEMORY_THRESHOLD) || 2048, // MB
-  
-  // Uptime thresholds
-  LONG_UPTIME_THRESHOLD: parseInt(process.env.LONG_UPTIME_THRESHOLD) || 30, // days
-  
+  VERY_HIGH_MEMORY_THRESHOLD:
+    parseInt(process.env.VERY_HIGH_MEMORY_THRESHOLD) || 2048, // MB
+
   // Logging
   LOG_LEVEL: process.env.LOG_LEVEL || 'info', // error, warn, info, debug
+
+  // Payment reconciliation (optional) - detects outgoing node payments not
+  // backed by a settled incoming hold invoice. Requires read-only access to
+  // the bot's MongoDB and the LND node.
+  MONGO_URI: process.env.MONGO_URI,
+  LND_GRPC_HOST: process.env.LND_GRPC_HOST,
+  LND_CERT_BASE64: process.env.LND_CERT_BASE64,
+  LND_MACAROON_BASE64: process.env.LND_MACAROON_BASE64,
+  RECONCILIATION_INTERVAL: parseInt(process.env.RECONCILIATION_INTERVAL) || 10, // minutes
+  RECONCILIATION_START_DATE: process.env.RECONCILIATION_START_DATE, // ISO date, optional
+  RECONCILIATION_STATE_FILE: process.env.RECONCILIATION_STATE_FILE, // optional
 };
+
+// Reconciliation is enabled only when its required config is complete
+config.RECONCILIATION_ENABLED = !!(
+  config.MONGO_URI &&
+  config.LND_GRPC_HOST &&
+  config.LND_MACAROON_BASE64
+);
 
 // Validation
 const requiredConfig = ['TELEGRAM_BOT_TOKEN'];
-const missingConfig = requiredConfig.filter(key => !config[key]);
+const missingConfig = requiredConfig.filter((key) => !config[key]);
 if (config.ADMIN_CHAT_IDS.length === 0) missingConfig.push('ADMIN_CHAT_ID');
 
 if (missingConfig.length > 0) {
-  console.error('❌ Missing required environment variables:', missingConfig.join(', '));
+  console.error(
+    '❌ Missing required environment variables:',
+    missingConfig.join(', ')
+  );
   console.error('');
   console.error('Required configuration:');
   console.error('  TELEGRAM_BOT_TOKEN - Telegram bot token for sending alerts');
-  console.error('  ADMIN_CHAT_ID - Comma-separated list of Telegram chat IDs to send alerts to');
+  console.error(
+    '  ADMIN_CHAT_ID - Comma-separated list of Telegram chat IDs to send alerts to'
+  );
   console.error('');
   console.error('Optional configuration:');
   console.error('  AUTH_TOKEN - Authentication token for heartbeat endpoint');
-  console.error('  MISSING_HEARTBEAT_THRESHOLD - Minutes before missing heartbeat alert (default: 6)');
-  console.error('  CRITICAL_ALERT_THROTTLE - Minutes between critical alerts (default: 5)');
-  console.error('  WARNING_ALERT_THROTTLE - Minutes between warning alerts (default: 30)');
-  console.error('  HIGH_MEMORY_THRESHOLD - Memory threshold in MB for alerts (default: 1024)');
-  console.error('  LOG_LEVEL - Logging level: error, warn, info, debug (default: info)');
+  console.error(
+    '  MISSING_HEARTBEAT_THRESHOLD - Minutes before missing heartbeat alert (default: 6)'
+  );
+  console.error(
+    '  CRITICAL_ALERT_THROTTLE - Minutes between critical alerts (default: 5)'
+  );
+  console.error(
+    '  WARNING_ALERT_THROTTLE - Minutes between warning alerts (default: 30)'
+  );
+  console.error(
+    '  HIGH_MEMORY_THRESHOLD - Memory threshold in MB for alerts (default: 1024)'
+  );
+  console.error(
+    '  LOG_LEVEL - Logging level: error, warn, info, debug (default: info)'
+  );
   console.error('');
   console.error('Example .env file:');
   console.error('  TELEGRAM_BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrsTUVwxyz');
@@ -59,8 +93,13 @@ if (missingConfig.length > 0) {
 }
 
 // Validate numeric values
-if (config.MISSING_HEARTBEAT_THRESHOLD < 1 || config.MISSING_HEARTBEAT_THRESHOLD > 60) {
-  console.error('❌ MISSING_HEARTBEAT_THRESHOLD must be between 1 and 60 minutes');
+if (
+  config.MISSING_HEARTBEAT_THRESHOLD < 1 ||
+  config.MISSING_HEARTBEAT_THRESHOLD > 60
+) {
+  console.error(
+    '❌ MISSING_HEARTBEAT_THRESHOLD must be between 1 and 60 minutes'
+  );
   process.exit(1);
 }
 
@@ -70,8 +109,49 @@ if (config.CRITICAL_ALERT_THROTTLE < 1 || config.CRITICAL_ALERT_THROTTLE > 60) {
 }
 
 if (config.WARNING_ALERT_THROTTLE < 1 || config.WARNING_ALERT_THROTTLE > 1440) {
-  console.error('❌ WARNING_ALERT_THROTTLE must be between 1 and 1440 minutes (24 hours)');
+  console.error(
+    '❌ WARNING_ALERT_THROTTLE must be between 1 and 1440 minutes (24 hours)'
+  );
   process.exit(1);
+}
+
+// Warn on partial reconciliation config: some vars set but not enough to run
+const reconciliationVars = [
+  'MONGO_URI',
+  'LND_GRPC_HOST',
+  'LND_MACAROON_BASE64',
+];
+const setReconciliationVars = reconciliationVars.filter((key) => config[key]);
+if (
+  setReconciliationVars.length > 0 &&
+  setReconciliationVars.length < reconciliationVars.length
+) {
+  const missing = reconciliationVars.filter((key) => !config[key]);
+  console.error(
+    `❌ Incomplete payment reconciliation config. Set all of ${reconciliationVars.join(', ')} or none. Missing: ${missing.join(', ')}`
+  );
+  process.exit(1);
+}
+
+if (config.RECONCILIATION_ENABLED) {
+  if (
+    config.RECONCILIATION_INTERVAL < 1 ||
+    config.RECONCILIATION_INTERVAL > 1440
+  ) {
+    console.error(
+      '❌ RECONCILIATION_INTERVAL must be between 1 and 1440 minutes'
+    );
+    process.exit(1);
+  }
+  if (
+    config.RECONCILIATION_START_DATE &&
+    isNaN(new Date(config.RECONCILIATION_START_DATE).getTime())
+  ) {
+    console.error(
+      '❌ RECONCILIATION_START_DATE must be a valid ISO date (e.g., 2026-08-01T00:00:00Z)'
+    );
+    process.exit(1);
+  }
 }
 
 // Validate log level
@@ -82,16 +162,25 @@ if (!validLogLevels.includes(config.LOG_LEVEL)) {
 }
 
 // Validate Telegram configuration format
-if (config.TELEGRAM_BOT_TOKEN && !config.TELEGRAM_BOT_TOKEN.match(/^\d+:[A-Za-z0-9_-]+$/)) {
-  console.error('❌ TELEGRAM_BOT_TOKEN format appears invalid (should be: 123456789:ABCdefGHI...)');
+if (
+  config.TELEGRAM_BOT_TOKEN &&
+  !config.TELEGRAM_BOT_TOKEN.match(/^\d+:[A-Za-z0-9_-]+$/)
+) {
+  console.error(
+    '❌ TELEGRAM_BOT_TOKEN format appears invalid (should be: 123456789:ABCdefGHI...)'
+  );
   console.error('   Get your bot token from @BotFather on Telegram');
   process.exit(1);
 }
 
 for (const chatId of config.ADMIN_CHAT_IDS) {
   if (!chatId.match(/^-?\d+$/)) {
-    console.error(`❌ Invalid ADMIN_CHAT_ID value: "${chatId}" — must be a number (e.g., -1001234567890 for groups, 1234567890 for private chats)`);
-    console.error('   Separate multiple IDs with commas: ADMIN_CHAT_ID=12345,54321');
+    console.error(
+      `❌ Invalid ADMIN_CHAT_ID value: "${chatId}" — must be a number (e.g., -1001234567890 for groups, 1234567890 for private chats)`
+    );
+    console.error(
+      '   Separate multiple IDs with commas: ADMIN_CHAT_ID=12345,54321'
+    );
     process.exit(1);
   }
 }
@@ -101,12 +190,35 @@ if (config.NODE_ENV === 'development') {
   console.log('📋 Configuration loaded:');
   console.log('  PORT:', config.PORT);
   console.log('  NODE_ENV:', config.NODE_ENV);
-  console.log('  TELEGRAM_BOT_TOKEN:', config.TELEGRAM_BOT_TOKEN ? '✅ Set' : '❌ Missing');
-  console.log('  ADMIN_CHAT_IDS:', config.ADMIN_CHAT_IDS.length > 0 ? `✅ ${config.ADMIN_CHAT_IDS.length} recipient(s)` : '❌ Missing');
-  console.log('  AUTH_TOKEN:', config.AUTH_TOKEN ? '✅ Set' : '⚠️ Not set (authentication disabled)');
-  console.log('  MISSING_HEARTBEAT_THRESHOLD:', config.MISSING_HEARTBEAT_THRESHOLD, 'minutes');
-  console.log('  CRITICAL_ALERT_THROTTLE:', config.CRITICAL_ALERT_THROTTLE, 'minutes');
-  console.log('  WARNING_ALERT_THROTTLE:', config.WARNING_ALERT_THROTTLE, 'minutes');
+  console.log(
+    '  TELEGRAM_BOT_TOKEN:',
+    config.TELEGRAM_BOT_TOKEN ? '✅ Set' : '❌ Missing'
+  );
+  console.log(
+    '  ADMIN_CHAT_IDS:',
+    config.ADMIN_CHAT_IDS.length > 0
+      ? `✅ ${config.ADMIN_CHAT_IDS.length} recipient(s)`
+      : '❌ Missing'
+  );
+  console.log(
+    '  AUTH_TOKEN:',
+    config.AUTH_TOKEN ? '✅ Set' : '⚠️ Not set (authentication disabled)'
+  );
+  console.log(
+    '  MISSING_HEARTBEAT_THRESHOLD:',
+    config.MISSING_HEARTBEAT_THRESHOLD,
+    'minutes'
+  );
+  console.log(
+    '  CRITICAL_ALERT_THROTTLE:',
+    config.CRITICAL_ALERT_THROTTLE,
+    'minutes'
+  );
+  console.log(
+    '  WARNING_ALERT_THROTTLE:',
+    config.WARNING_ALERT_THROTTLE,
+    'minutes'
+  );
   console.log('  HIGH_MEMORY_THRESHOLD:', config.HIGH_MEMORY_THRESHOLD, 'MB');
   console.log('  LOG_LEVEL:', config.LOG_LEVEL);
   console.log('');

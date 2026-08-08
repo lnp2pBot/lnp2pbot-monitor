@@ -7,10 +7,14 @@ require('dotenv').config();
 const config = require('./config');
 const logger = require('./src/utils').logger;
 const BotMonitor = require('./src/monitor');
+const PaymentReconciler = require('./src/reconciliation');
 const { createDashboard } = require('./src/dashboard');
 
 const app = express();
 const monitor = new BotMonitor(config);
+const reconciler = config.RECONCILIATION_ENABLED
+  ? new PaymentReconciler(config, (message) => monitor.sendAlert(message))
+  : null;
 
 // Security middleware
 app.use(helmet());
@@ -86,8 +90,8 @@ app.post('/api/heartbeat', heartbeatLimiter, authenticateToken, (req, res) => {
     }
 
     if (!healthData.bot || !healthData.timestamp) {
-      return res.status(400).json({ 
-        error: 'Missing required fields: bot, timestamp' 
+      return res.status(400).json({
+        error: 'Missing required fields: bot, timestamp',
       });
     }
 
@@ -102,8 +106,8 @@ app.post('/api/heartbeat', heartbeatLimiter, authenticateToken, (req, res) => {
         bot: healthData.bot,
         timestampAge: Math.floor(timestampAge / 60000) + ' minutes',
       });
-      return res.status(400).json({ 
-        error: 'Timestamp too old' 
+      return res.status(400).json({
+        error: 'Timestamp too old',
       });
     }
 
@@ -112,8 +116,8 @@ app.post('/api/heartbeat', heartbeatLimiter, authenticateToken, (req, res) => {
         bot: healthData.bot,
         timestampAge: Math.floor(-timestampAge / 60000) + ' minutes in future',
       });
-      return res.status(400).json({ 
-        error: 'Timestamp too far in future' 
+      return res.status(400).json({
+        error: 'Timestamp too far in future',
       });
     }
 
@@ -124,23 +128,24 @@ app.post('/api/heartbeat', heartbeatLimiter, authenticateToken, (req, res) => {
       bot: healthData.bot,
       dbState: healthData.dbState,
       lightningConnected: healthData.lightningConnected,
-      memory: healthData.memory ? Math.round(healthData.memory.rss / 1024 / 1024) + 'MB' : 'unknown',
+      memory: healthData.memory
+        ? Math.round(healthData.memory.rss / 1024 / 1024) + 'MB'
+        : 'unknown',
     });
 
-    res.json({ 
+    res.json({
       status: 'received',
       timestamp: new Date().toISOString(),
     });
-
   } catch (error) {
     logger.error('Error processing heartbeat', {
       error: error.message,
       stack: error.stack,
       body: req.body,
     });
-    
-    res.status(500).json({ 
-      error: 'Internal server error processing heartbeat' 
+
+    res.status(500).json({
+      error: 'Internal server error processing heartbeat',
     });
   }
 });
@@ -158,21 +163,30 @@ app.get('/api/status', (req, res) => {
       error: error.message,
       stack: error.stack,
     });
-    
-    res.status(500).json({ 
-      error: 'Internal server error getting status' 
+
+    res.status(500).json({
+      error: 'Internal server error getting status',
     });
   }
 });
 
+// Payment reconciliation status
+app.get('/api/reconciliation', (req, res) => {
+  if (!reconciler) {
+    return res.json({ enabled: false });
+  }
+  res.json(reconciler.getStatus());
+});
+
 // 404 handler
 app.use((req, res) => {
-  res.status(404).json({ 
+  res.status(404).json({
     error: 'Not found',
     availableEndpoints: [
       'GET /',
       'GET /health',
       'GET /api/status',
+      'GET /api/reconciliation',
       'POST /api/heartbeat',
     ],
   });
@@ -187,8 +201,8 @@ app.use((err, req, res, next) => {
     method: req.method,
   });
 
-  res.status(500).json({ 
-    error: 'Internal server error' 
+  res.status(500).json({
+    error: 'Internal server error',
   });
 });
 
@@ -229,6 +243,43 @@ const server = app.listen(PORT, () => {
 
   // Initialize monitoring system
   monitor.start();
+
+  // Start payment reconciliation when configured. A start failure (MongoDB or
+  // LND unreachable) must not go silent: this feature watches money leaving
+  // the node, so alert the admins and keep retrying until it comes up. Alerts
+  // are throttled harder than retries so a long outage doesn't spam.
+  if (reconciler) {
+    const RECONCILIATION_START_RETRY_MS = 5 * 60 * 1000;
+    const START_FAILURE_ALERT_THROTTLE_MS = 60 * 60 * 1000;
+    let lastStartFailureAlertAt = 0;
+    const startReconciliation = () => {
+      reconciler.start().catch(async (error) => {
+        reconciler.lastError = `Failed to start: ${error.message}`;
+        logger.error('Failed to start payment reconciliation, will retry', {
+          error: error.message,
+          stack: error.stack,
+          retryInMinutes: RECONCILIATION_START_RETRY_MS / 60000,
+        });
+        if (
+          Date.now() - lastStartFailureAlertAt >
+          START_FAILURE_ALERT_THROTTLE_MS
+        ) {
+          const sent = await monitor
+            .sendAlert(
+              `🚨 CRITICAL: payment reconciliation failed to start: ${error.message}. Outgoing payments are NOT being monitored. Retrying every ${RECONCILIATION_START_RETRY_MS / 60000} minutes.`
+            )
+            .catch(() => false);
+          if (sent) lastStartFailureAlertAt = Date.now();
+        }
+        setTimeout(startReconciliation, RECONCILIATION_START_RETRY_MS);
+      });
+    };
+    startReconciliation();
+  } else {
+    logger.info(
+      'Payment reconciliation disabled (set MONGO_URI, LND_GRPC_HOST and LND_MACAROON_BASE64 to enable)'
+    );
+  }
 });
 
 module.exports = { app, server };

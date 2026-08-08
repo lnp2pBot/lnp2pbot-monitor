@@ -144,7 +144,50 @@ The service receives and analyzes comprehensive health data from lnp2pBot:
 - ⚠️ **Lightning node not synced to graph**
 - ⚠️ **No active Lightning channels**
 - ⚠️ **High memory usage (>1GB)**
-- ⚠️ **Very long uptime (>30 days)**
+
+### Payment Reconciliation (optional)
+
+Detects the worst-case failure for a P2P bot: **the node paying out satoshis
+that never came in**. When enabled, the monitor periodically lists every
+settled outgoing payment made by the bot's LND node and verifies each one is
+backed by data in the bot's database:
+
+1. **Buyer payouts** — matched by payment hash against `Order.payout_hash`
+   (with a fallback match on the paid invoice for older orders). The order's
+   hold invoice (`Order.hash`) must exist on the node, be settled, and have
+   received at least the amount paid out. The paid amount must equal
+   `order.amount`.
+2. **Community earnings withdrawals** — matched by payment hash against
+   `PendingPayment` records with a `community_id`.
+
+Matching is done strictly by payment hash — never by time — so a payout that
+settles days after the seller released the funds (e.g., a routing failure
+retried with a new invoice via `/setinvoice`) still reconciles against the
+original hold invoice.
+
+Any settled outgoing payment that fails these checks triggers a critical
+Telegram alert including the amount, destination pubkey, payment hash,
+invoice, and timestamps. Each payment hash is alerted only once (state is
+persisted in `data/reconciliation-state.json`).
+
+The reconciler also watches itself: if it cannot start (MongoDB or LND
+unreachable) it retries every 5 minutes and alerts the admins (throttled to
+once per hour), and if reconciliation passes fail repeatedly while running, a
+critical alert is sent as well. A reconciler that cannot run must never fail
+silently.
+
+To enable, set `MONGO_URI` (read-only Mongo user), `LND_GRPC_HOST`, and
+`LND_MACAROON_BASE64` (read-only macaroon — only `ListPayments` and
+`LookupInvoice` are needed). See `.env.example` for all options. Check
+reconciliation status at `GET /api/reconciliation`.
+
+> **Note on database load:** each reconciled payment runs `findOne` lookups on
+> `orders.payout_hash`, `orders.buyer_invoice_paid`, `orders.buyer_invoice`,
+> `pendingpayments.hash` and `pendingpayments.payment_request`. Of these, only
+> `orders.hash` is indexed by the bot today. With the default 10-minute
+> interval only new payments are examined, so the load is minimal, but for
+> large databases consider creating indexes on those fields in the bot's
+> MongoDB.
 
 ### Status Dashboard
 
@@ -193,6 +236,15 @@ Status dashboard with current bot health.
 Health check for this monitor service (for UptimeRobot).
 
 **Response:** `200 OK` with `{"status": "ok", "monitoring": "active"}`
+
+### GET `/api/reconciliation`
+
+Payment reconciliation status.
+
+**Response:** `{"enabled": false}` when reconciliation is not configured,
+otherwise `{"enabled": true, "baselineAt": ..., "lastPaymentIndex": ...,
+"alertedPayments": ..., "isRunning": ..., "lastError": ...}` (`lastError` is
+`null` when the last pass succeeded).
 
 ## Deployment
 

@@ -10,7 +10,6 @@ const mockConfig = {
   WARNING_ALERT_THROTTLE: 30,
   HIGH_MEMORY_THRESHOLD: 1024,
   VERY_HIGH_MEMORY_THRESHOLD: 2048,
-  LONG_UPTIME_THRESHOLD: 30,
 };
 
 // Mock Telegram bot
@@ -66,6 +65,51 @@ describe('BotMonitor', () => {
       expect(monitor.lastHeartbeat).toBeGreaterThan(0);
       expect(monitor.botMetrics).toEqual(validHealthData);
       expect(monitor.consecutiveFailures).toBe(0);
+    });
+
+    test('should send recovery notification after two missed heartbeats', () => {
+      const validHealthData = {
+        bot: 'lnp2pBot',
+        timestamp: Date.now(),
+        uptime: 3600,
+        memory: { rss: 134217728, heapUsed: 67108864, heapTotal: 134217728 },
+        processId: 1234,
+        dbConnected: true,
+        dbState: 'connected',
+        lightningConnected: true,
+      };
+      // Two missing-heartbeat checks already fired (critical situation)
+      monitor.consecutiveFailures = 2;
+
+      monitor.recordHeartbeat(validHealthData);
+
+      expect(monitor.consecutiveFailures).toBe(0);
+      expect(monitor.alertBot.sendMessage).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.stringContaining('recovered')
+      );
+    });
+
+    test('should not send recovery notification after a single missed heartbeat', () => {
+      const validHealthData = {
+        bot: 'lnp2pBot',
+        timestamp: Date.now(),
+        uptime: 3600,
+        memory: { rss: 134217728, heapUsed: 67108864, heapTotal: 134217728 },
+        processId: 1234,
+        dbConnected: true,
+        dbState: 'connected',
+        lightningConnected: true,
+      };
+      monitor.consecutiveFailures = 1;
+
+      monitor.recordHeartbeat(validHealthData);
+
+      expect(monitor.consecutiveFailures).toBe(0);
+      expect(monitor.alertBot.sendMessage).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.stringContaining('recovered')
+      );
     });
 
     test('should handle invalid heartbeat data', () => {
@@ -195,7 +239,10 @@ describe('BotMonitor', () => {
 
     test('should not alert when heartbeat is recent', async () => {
       monitor.lastHeartbeat = Date.now() - 1000; // 1 second ago
-      const sendAlertWithThrottlingSpy = jest.spyOn(monitor, 'sendAlertWithThrottling');
+      const sendAlertWithThrottlingSpy = jest.spyOn(
+        monitor,
+        'sendAlertWithThrottling'
+      );
 
       await monitor.checkMissingHeartbeat();
 
@@ -203,8 +250,9 @@ describe('BotMonitor', () => {
     });
 
     test('should alert when heartbeat is missing', async () => {
-      monitor.lastHeartbeat = Date.now() - (10 * 60 * 1000); // 10 minutes ago
-      const sendAlertWithThrottlingSpy = jest.spyOn(monitor, 'sendAlertWithThrottling')
+      monitor.lastHeartbeat = Date.now() - 10 * 60 * 1000; // 10 minutes ago
+      const sendAlertWithThrottlingSpy = jest
+        .spyOn(monitor, 'sendAlertWithThrottling')
         .mockResolvedValue();
 
       await monitor.checkMissingHeartbeat();
@@ -212,16 +260,17 @@ describe('BotMonitor', () => {
       expect(sendAlertWithThrottlingSpy).toHaveBeenCalledWith({
         level: 'warning',
         message: expect.stringContaining('heartbeat missing'),
-        key: 'missing_heartbeat'
+        key: 'missing_heartbeat',
       });
       expect(monitor.consecutiveFailures).toBe(1);
     });
 
     test('should escalate alert after multiple failures', async () => {
-      monitor.lastHeartbeat = Date.now() - (10 * 60 * 1000); // 10 minutes ago
+      monitor.lastHeartbeat = Date.now() - 10 * 60 * 1000; // 10 minutes ago
       monitor.consecutiveFailures = 1; // Already failed once
-      
-      const sendAlertWithThrottlingSpy = jest.spyOn(monitor, 'sendAlertWithThrottling')
+
+      const sendAlertWithThrottlingSpy = jest
+        .spyOn(monitor, 'sendAlertWithThrottling')
         .mockResolvedValue();
 
       await monitor.checkMissingHeartbeat();
@@ -229,7 +278,7 @@ describe('BotMonitor', () => {
       expect(sendAlertWithThrottlingSpy).toHaveBeenCalledWith({
         level: 'critical',
         message: expect.stringContaining('CRITICAL'),
-        key: 'bot_silent'
+        key: 'bot_silent',
       });
       expect(monitor.consecutiveFailures).toBe(2);
     });
@@ -249,7 +298,8 @@ describe('BotMonitor', () => {
     });
 
     test('should return true if at least one delivery succeeds', async () => {
-      const mockSendMessage = jest.fn()
+      const mockSendMessage = jest
+        .fn()
         .mockRejectedValueOnce(new Error('Network error'))
         .mockResolvedValueOnce({});
       monitor.alertBot.sendMessage = mockSendMessage;
@@ -260,7 +310,9 @@ describe('BotMonitor', () => {
     });
 
     test('should return false if all deliveries fail', async () => {
-      const mockSendMessage = jest.fn().mockRejectedValue(new Error('Network error'));
+      const mockSendMessage = jest
+        .fn()
+        .mockRejectedValue(new Error('Network error'));
       monitor.alertBot.sendMessage = mockSendMessage;
 
       const result = await monitor.sendAlert('Test alert');
@@ -298,9 +350,11 @@ describe('BotMonitor', () => {
 
   describe('testTelegramConnection', () => {
     test('should test connection successfully', async () => {
-      const mockGetMe = jest.fn().mockResolvedValue({ username: 'test_bot', id: 123456789 });
+      const mockGetMe = jest
+        .fn()
+        .mockResolvedValue({ username: 'test_bot', id: 123456789 });
       const mockSendMessage = jest.fn().mockResolvedValue({});
-      
+
       monitor.alertBot.getMe = mockGetMe;
       monitor.alertBot.sendMessage = mockSendMessage;
 

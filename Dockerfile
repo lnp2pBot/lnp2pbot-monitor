@@ -1,5 +1,6 @@
 # Use official Node.js runtime as base image
-FROM node:18-alpine
+# Node 22+ required by the `lightning` dependency (payment reconciliation)
+FROM node:22-alpine
 
 # Set the working directory in the container
 WORKDIR /usr/src/app
