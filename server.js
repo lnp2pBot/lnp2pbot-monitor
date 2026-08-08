@@ -243,14 +243,35 @@ const server = app.listen(PORT, () => {
   // Initialize monitoring system
   monitor.start();
 
-  // Start payment reconciliation when configured
+  // Start payment reconciliation when configured. A start failure (MongoDB or
+  // LND unreachable) must not go silent: this feature watches money leaving
+  // the node, so alert the admins and keep retrying until it comes up.
   if (reconciler) {
-    reconciler.start().catch((error) => {
-      logger.error('Failed to start payment reconciliation', {
-        error: error.message,
-        stack: error.stack,
-      });
-    });
+    const RECONCILIATION_START_RETRY_MS = 5 * 60 * 1000;
+    const startReconciliation = () => {
+      reconciler
+        .start()
+        .then(() => {
+          reconciler.lastError = null;
+        })
+        .catch((error) => {
+          reconciler.lastError = `Failed to start: ${error.message}`;
+          logger.error('Failed to start payment reconciliation, will retry', {
+            error: error.message,
+            stack: error.stack,
+            retryInMinutes: RECONCILIATION_START_RETRY_MS / 60000,
+          });
+          monitor
+            .sendAlertWithThrottling({
+              level: 'critical',
+              message: `🚨 CRITICAL: payment reconciliation failed to start: ${error.message}. Outgoing payments are NOT being monitored. Retrying every ${RECONCILIATION_START_RETRY_MS / 60000} minutes.`,
+              key: 'reconciliation_start_failed',
+            })
+            .catch(() => {});
+          setTimeout(startReconciliation, RECONCILIATION_START_RETRY_MS);
+        });
+    };
+    startReconciliation();
   } else {
     logger.info(
       'Payment reconciliation disabled (set MONGO_URI, LND_GRPC_HOST and LND_MACAROON_BASE64 to enable)'

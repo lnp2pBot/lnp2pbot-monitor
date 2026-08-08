@@ -175,6 +175,14 @@ To enable, set `MONGO_URI` (read-only Mongo user), `LND_GRPC_HOST`, and
 `LookupInvoice` are needed). See `.env.example` for all options. Check
 reconciliation status at `GET /api/reconciliation`.
 
+> **Note on database load:** each reconciled payment runs `findOne` lookups on
+> `orders.payout_hash`, `orders.buyer_invoice_paid`, `orders.buyer_invoice`,
+> `pendingpayments.hash` and `pendingpayments.payment_request`. Of these, only
+> `orders.hash` is indexed by the bot today. With the default 10-minute
+> interval only new payments are examined, so the load is minimal, but for
+> large databases consider creating indexes on those fields in the bot's
+> MongoDB.
+
 ### Status Dashboard
 
 Access the status dashboard at: `http://your-monitor-url/`
@@ -222,6 +230,15 @@ Status dashboard with current bot health.
 Health check for this monitor service (for UptimeRobot).
 
 **Response:** `200 OK` with `{"status": "ok", "monitoring": "active"}`
+
+### GET `/api/reconciliation`
+
+Payment reconciliation status.
+
+**Response:** `{"enabled": false}` when reconciliation is not configured,
+otherwise `{"enabled": true, "baselineAt": ..., "lastPaymentIndex": ...,
+"alertedPayments": ..., "isRunning": ..., "lastError": ...}` (`lastError` is
+`null` when the last pass succeeded).
 
 ## Deployment
 

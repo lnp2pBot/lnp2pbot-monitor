@@ -67,6 +67,51 @@ describe('BotMonitor', () => {
       expect(monitor.consecutiveFailures).toBe(0);
     });
 
+    test('should send recovery notification after two missed heartbeats', () => {
+      const validHealthData = {
+        bot: 'lnp2pBot',
+        timestamp: Date.now(),
+        uptime: 3600,
+        memory: { rss: 134217728, heapUsed: 67108864, heapTotal: 134217728 },
+        processId: 1234,
+        dbConnected: true,
+        dbState: 'connected',
+        lightningConnected: true,
+      };
+      // Two missing-heartbeat checks already fired (critical situation)
+      monitor.consecutiveFailures = 2;
+
+      monitor.recordHeartbeat(validHealthData);
+
+      expect(monitor.consecutiveFailures).toBe(0);
+      expect(monitor.alertBot.sendMessage).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.stringContaining('recovered')
+      );
+    });
+
+    test('should not send recovery notification after a single missed heartbeat', () => {
+      const validHealthData = {
+        bot: 'lnp2pBot',
+        timestamp: Date.now(),
+        uptime: 3600,
+        memory: { rss: 134217728, heapUsed: 67108864, heapTotal: 134217728 },
+        processId: 1234,
+        dbConnected: true,
+        dbState: 'connected',
+        lightningConnected: true,
+      };
+      monitor.consecutiveFailures = 1;
+
+      monitor.recordHeartbeat(validHealthData);
+
+      expect(monitor.consecutiveFailures).toBe(0);
+      expect(monitor.alertBot.sendMessage).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.stringContaining('recovered')
+      );
+    });
+
     test('should handle invalid heartbeat data', () => {
       const invalidHealthData = {
         // Missing required fields

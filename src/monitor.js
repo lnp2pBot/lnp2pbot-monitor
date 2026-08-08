@@ -45,7 +45,21 @@ class BotMonitor {
 
       this.lastHeartbeat = Date.now();
       this.botMetrics = healthData;
+      // Capture the critical state before resetting: this is the only place
+      // that can observe a recovery, since the reset happens here.
+      const hadCriticalFailure = this.consecutiveFailures > 1;
       this.consecutiveFailures = 0;
+
+      if (hadCriticalFailure) {
+        this.sendAlert(
+          '✅ Bot heartbeat recovered - all systems operational'
+        ).catch((error) => {
+          logger.error('Failed to send heartbeat recovery alert', {
+            error: error.message,
+            stack: error.stack,
+          });
+        });
+      }
 
       logger.debug('Heartbeat recorded successfully', {
         bot: healthData.bot,
@@ -283,23 +297,14 @@ class BotMonitor {
           key: 'bot_silent',
         });
       }
-    } else {
-      // Reset consecutive failures if heartbeat is recent
-      if (this.consecutiveFailures > 0) {
-        logger.info('Bot heartbeat recovered', {
-          consecutiveFailures: this.consecutiveFailures,
-          minutesSinceLastHeartbeat: Math.floor(timeSinceLastHeartbeat / 60000),
-        });
-
-        this.consecutiveFailures = 0;
-
-        // Send recovery notification for critical situations
-        if (this.consecutiveFailures > 1) {
-          await this.sendAlert(
-            '✅ Bot heartbeat recovered - all systems operational'
-          );
-        }
-      }
+    } else if (this.consecutiveFailures > 0) {
+      // Defensive reset; recovery is normally observed (and the recovery
+      // notification sent) in recordHeartbeat, which resets the counter.
+      logger.info('Bot heartbeat recovered', {
+        consecutiveFailures: this.consecutiveFailures,
+        minutesSinceLastHeartbeat: Math.floor(timeSinceLastHeartbeat / 60000),
+      });
+      this.consecutiveFailures = 0;
     }
   }
 

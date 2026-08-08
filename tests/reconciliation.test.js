@@ -8,13 +8,22 @@ const PAYOUT_HASH = 'b'.repeat(64);
 const COMMUNITY_HASH = 'c'.repeat(64);
 const ROGUE_HASH = 'd'.repeat(64);
 
-const baseConfig = () => ({
-  RECONCILIATION_INTERVAL: 10,
-  RECONCILIATION_START_DATE: '2026-01-01T00:00:00.000Z',
-  RECONCILIATION_STATE_FILE: path.join(
-    fs.mkdtempSync(path.join(os.tmpdir(), 'reconciliation-test-')),
-    'state.json'
-  ),
+const tempDirs = [];
+
+const baseConfig = () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'reconciliation-test-'));
+  tempDirs.push(dir);
+  return {
+    RECONCILIATION_INTERVAL: 10,
+    RECONCILIATION_START_DATE: '2026-01-01T00:00:00.000Z',
+    RECONCILIATION_STATE_FILE: path.join(dir, 'state.json'),
+  };
+};
+
+afterAll(() => {
+  for (const dir of tempDirs) {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 const makePayment = (overrides = {}) => ({
@@ -257,7 +266,9 @@ describe('PaymentReconciler.run', () => {
     expect(sendAlert).not.toHaveBeenCalled();
   });
 
-  test('ignores unconfirmed payments but still advances the payment index', async () => {
+  test('does not advance the checkpoint past an in-flight payment', async () => {
+    // LND assigns the index at initiation: if the checkpoint moved past an
+    // unconfirmed payment, it would never be examined after settling.
     const payment = makePayment({
       id: ROGUE_HASH,
       is_confirmed: false,
@@ -268,6 +279,40 @@ describe('PaymentReconciler.run', () => {
     await reconciler.run();
 
     expect(sendAlert).not.toHaveBeenCalled();
+    expect(reconciler.state.lastIndex).toBeLessThan(7);
+  });
+
+  test('re-examines an in-flight payment once it settles', async () => {
+    const getPayments = jest
+      .fn()
+      .mockResolvedValueOnce({
+        payments: [
+          makePayment({ id: ROGUE_HASH, is_confirmed: false, index: 7 }),
+        ],
+        next: null,
+      })
+      .mockImplementation(async ({ token }) => {
+        // Second pass must ask for an offset below the in-flight index
+        const offset = token ? JSON.parse(token).offset : 0;
+        const settled = makePayment({
+          id: ROGUE_HASH,
+          is_confirmed: true,
+          index: 7,
+        });
+        return { payments: settled.index > offset ? [settled] : [], next: null };
+      });
+    const sendAlert = jest.fn().mockResolvedValue(true);
+    const reconciler = new PaymentReconciler(baseConfig(), sendAlert, {
+      db: makeDb(),
+      getPayments,
+      getInvoice: jest.fn(),
+    });
+
+    await reconciler.run();
+    expect(sendAlert).not.toHaveBeenCalled();
+
+    await reconciler.run();
+    expect(sendAlert).toHaveBeenCalledTimes(1);
     expect(reconciler.state.lastIndex).toBe(7);
   });
 
@@ -314,5 +359,7 @@ describe('PaymentReconciler.run', () => {
     await reconciler.run();
 
     expect(reconciler.state.alerted[ROGUE_HASH]).toBeUndefined();
+    // The checkpoint must not advance past it either, so it is retried
+    expect(reconciler.state.lastIndex).toBeLessThan(payment.index);
   });
 });

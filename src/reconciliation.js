@@ -38,6 +38,7 @@ class PaymentReconciler {
     this.mongoClient = null;
     this.isRunning = false;
     this.intervalHandle = null;
+    this.lastError = null;
     this.statePath =
       config.RECONCILIATION_STATE_FILE ||
       path.join(process.cwd(), 'data', 'reconciliation-state.json');
@@ -45,9 +46,23 @@ class PaymentReconciler {
   }
 
   loadState() {
+    const defaults = { baselineAt: null, lastIndex: 0, alerted: {} };
     try {
       if (fs.existsSync(this.statePath)) {
-        return JSON.parse(fs.readFileSync(this.statePath, 'utf8'));
+        const parsed = JSON.parse(fs.readFileSync(this.statePath, 'utf8'));
+        if (parsed && typeof parsed === 'object') {
+          // Merge over defaults: a hand-edited or older-format file must not
+          // leave fields like `alerted` undefined and crash every pass.
+          return {
+            ...defaults,
+            ...parsed,
+            lastIndex: Number(parsed.lastIndex) || 0,
+            alerted:
+              parsed.alerted && typeof parsed.alerted === 'object'
+                ? parsed.alerted
+                : {},
+          };
+        }
       }
     } catch (error) {
       logger.error('Failed to load reconciliation state, starting fresh', {
@@ -55,7 +70,7 @@ class PaymentReconciler {
         statePath: this.statePath,
       });
     }
-    return { baselineAt: null, lastIndex: 0, alerted: {} };
+    return defaults;
   }
 
   saveState() {
@@ -305,12 +320,19 @@ class PaymentReconciler {
       const payments = await this.fetchNewPayments();
       let alerts = 0;
       let scanned = 0;
+      // LND assigns the payment index at initiation, so a payment observed
+      // in flight keeps its index after it settles. Never advance the
+      // checkpoint past a payment that still needs another look (unconfirmed,
+      // or its alert could not be delivered), or it would be skipped forever.
+      let highestSeen = this.state.lastIndex;
+      let lowestUnresolved = Infinity;
 
       for (const payment of payments) {
-        if (payment.index > this.state.lastIndex) {
-          this.state.lastIndex = payment.index;
+        if (payment.index > highestSeen) highestSeen = payment.index;
+        if (!payment.is_confirmed) {
+          lowestUnresolved = Math.min(lowestUnresolved, payment.index);
+          continue;
         }
-        if (!payment.is_confirmed) continue;
         const confirmedAt = new Date(
           payment.confirmed_at || payment.created_at
         ).getTime();
@@ -332,6 +354,7 @@ class PaymentReconciler {
             this.buildAlertMessage(payment, result)
           );
           if (sent) this.state.alerted[payment.id] = Date.now();
+          else lowestUnresolved = Math.min(lowestUnresolved, payment.index);
         } else {
           logger.info('Reconciliation: payment verified', {
             hash: payment.id,
@@ -341,6 +364,7 @@ class PaymentReconciler {
         }
       }
 
+      this.state.lastIndex = Math.min(highestSeen, lowestUnresolved - 1);
       this.pruneAlertHistory();
       this.saveState();
       logger.info('Reconciliation pass finished', {
@@ -363,12 +387,18 @@ class PaymentReconciler {
     const intervalMs = this.config.RECONCILIATION_INTERVAL * 60 * 1000;
 
     const safeRun = () =>
-      this.run().catch((error) => {
-        logger.error('Reconciliation pass failed', {
-          error: error.message,
-          stack: error.stack,
+      this.run()
+        .then((result) => {
+          this.lastError = null;
+          return result;
+        })
+        .catch((error) => {
+          this.lastError = `Reconciliation pass failed: ${error.message}`;
+          logger.error('Reconciliation pass failed', {
+            error: error.message,
+            stack: error.stack,
+          });
         });
-      });
 
     await safeRun();
     this.intervalHandle = setInterval(safeRun, intervalMs);
@@ -400,6 +430,7 @@ class PaymentReconciler {
       lastPaymentIndex: this.state.lastIndex,
       alertedPayments: Object.keys(this.state.alerted).length,
       isRunning: this.isRunning,
+      lastError: this.lastError,
     };
   }
 }
