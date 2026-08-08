@@ -170,6 +170,12 @@ Telegram alert including the amount, destination pubkey, payment hash,
 invoice, and timestamps. Each payment hash is alerted only once (state is
 persisted in `data/reconciliation-state.json`).
 
+The reconciler also watches itself: if it cannot start (MongoDB or LND
+unreachable) it retries every 5 minutes and alerts the admins (throttled to
+once per hour), and if reconciliation passes fail repeatedly while running, a
+critical alert is sent as well. A reconciler that cannot run must never fail
+silently.
+
 To enable, set `MONGO_URI` (read-only Mongo user), `LND_GRPC_HOST`, and
 `LND_MACAROON_BASE64` (read-only macaroon — only `ListPayments` and
 `LookupInvoice` are needed). See `.env.example` for all options. Check

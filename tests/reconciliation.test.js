@@ -283,6 +283,9 @@ describe('PaymentReconciler.run', () => {
   });
 
   test('re-examines an in-flight payment once it settles', async () => {
+    // The real client paginates BACKWARDS (tokenless call = newest page), so
+    // this mock must not expect a hand-made offset token. The second pass
+    // sees the same index again because the checkpoint never moved past it.
     const getPayments = jest
       .fn()
       .mockResolvedValueOnce({
@@ -291,15 +294,11 @@ describe('PaymentReconciler.run', () => {
         ],
         next: null,
       })
-      .mockImplementation(async ({ token }) => {
-        // Second pass must ask for an offset below the in-flight index
-        const offset = token ? JSON.parse(token).offset : 0;
-        const settled = makePayment({
-          id: ROGUE_HASH,
-          is_confirmed: true,
-          index: 7,
-        });
-        return { payments: settled.index > offset ? [settled] : [], next: null };
+      .mockResolvedValue({
+        payments: [
+          makePayment({ id: ROGUE_HASH, is_confirmed: true, index: 7 }),
+        ],
+        next: null,
       });
     const sendAlert = jest.fn().mockResolvedValue(true);
     const reconciler = new PaymentReconciler(baseConfig(), sendAlert, {
@@ -314,6 +313,38 @@ describe('PaymentReconciler.run', () => {
     await reconciler.run();
     expect(sendAlert).toHaveBeenCalledTimes(1);
     expect(reconciler.state.lastIndex).toBe(7);
+    // Every pass must start tokenless (newest page); an offset token would
+    // page backwards from the checkpoint and miss newer payments.
+    for (const [args] of getPayments.mock.calls) {
+      expect(args.token).toBeUndefined();
+    }
+  });
+
+  test('reconciles payments made after the checkpoint (steady state)', async () => {
+    // End-to-end guard for the backwards-pagination contract: with a
+    // persisted checkpoint, a payment that settles later must still be seen.
+    const rogue = makePayment({ id: ROGUE_HASH, index: 12 });
+    const getPayments = jest.fn(async ({ token }) => {
+      if (!token) return { payments: [rogue], next: 'older-page' };
+      return {
+        payments: [makePayment({ id: '0'.repeat(64), index: 10 })],
+        next: null,
+      };
+    });
+    const sendAlert = jest.fn().mockResolvedValue(true);
+    const reconciler = new PaymentReconciler(baseConfig(), sendAlert, {
+      db: makeDb(),
+      getPayments,
+      getInvoice: jest.fn(),
+    });
+    reconciler.state.lastIndex = 10;
+
+    const { scanned, alerts } = await reconciler.run();
+
+    expect(scanned).toBe(1);
+    expect(alerts).toBe(1);
+    expect(sendAlert).toHaveBeenCalledTimes(1);
+    expect(reconciler.state.lastIndex).toBe(12);
   });
 
   test('verified payments do not trigger alerts', async () => {
@@ -361,5 +392,122 @@ describe('PaymentReconciler.run', () => {
     expect(reconciler.state.alerted[ROGUE_HASH]).toBeUndefined();
     // The checkpoint must not advance past it either, so it is retried
     expect(reconciler.state.lastIndex).toBeLessThan(payment.index);
+  });
+});
+
+describe('PaymentReconciler.fetchNewPayments', () => {
+  test('sees payments newer than the checkpoint (LND paginates backwards)', async () => {
+    // Regression test: LND's listPayments is always backwards — a tokenless
+    // call returns the NEWEST page and `next` walks further back. The old
+    // code sent a hand-made `{offset: lastIndex}` token, which seeks
+    // BACKWARDS from that offset, so no payment newer than the checkpoint
+    // was ever returned after the first pass.
+    const newest = makePayment({ id: 'e'.repeat(64), index: 12 });
+    const middle = makePayment({ id: 'f'.repeat(64), index: 11 });
+    const atCheckpoint = makePayment({ id: '0'.repeat(64), index: 10 });
+    const getPayments = jest.fn(async ({ token }) => {
+      if (!token) return { payments: [newest, middle], next: 'older-page' };
+      return { payments: [atCheckpoint], next: 'even-older-page' };
+    });
+    const reconciler = new PaymentReconciler(baseConfig(), jest.fn(), {
+      db: makeDb(),
+      getPayments,
+      getInvoice: jest.fn(),
+    });
+    reconciler.state.lastIndex = 10;
+
+    const payments = await reconciler.fetchNewPayments();
+
+    expect(payments.map((p) => p.index)).toEqual([12, 11]);
+    // First request must be tokenless, and paging must stop as soon as a
+    // page reaches the checkpoint (no full-history scan per pass).
+    expect(getPayments).toHaveBeenCalledTimes(2);
+    expect(getPayments.mock.calls[0][0]).toEqual({ limit: 250 });
+  });
+});
+
+describe('PaymentReconciler.loadState', () => {
+  test('discards a corrupt baselineAt from a hand-edited state file', () => {
+    const config = baseConfig();
+    fs.writeFileSync(
+      config.RECONCILIATION_STATE_FILE,
+      JSON.stringify({
+        baselineAt: 'not-a-date',
+        lastIndex: 5,
+        alerted: { x: 1 },
+      })
+    );
+
+    const reconciler = new PaymentReconciler(config, jest.fn(), {
+      db: makeDb(),
+      getPayments: jest.fn(),
+      getInvoice: jest.fn(),
+    });
+
+    // A NaN baseline would disable the date filter entirely; it must be
+    // dropped so run() sets a fresh one.
+    expect(reconciler.state.baselineAt).toBeNull();
+    expect(reconciler.state.lastIndex).toBe(5);
+    expect(reconciler.state.alerted).toEqual({ x: 1 });
+  });
+});
+
+describe('PaymentReconciler.runSafely', () => {
+  const failingReconciler = (sendAlert) =>
+    new PaymentReconciler(baseConfig(), sendAlert, {
+      db: makeDb(),
+      getPayments: jest.fn().mockRejectedValue(new Error('lnd down')),
+      getInvoice: jest.fn(),
+    });
+
+  test('alerts after repeated consecutive pass failures, then throttles', async () => {
+    const sendAlert = jest.fn().mockResolvedValue(true);
+    const reconciler = failingReconciler(sendAlert);
+
+    await reconciler.runSafely();
+    await reconciler.runSafely();
+    expect(sendAlert).not.toHaveBeenCalled();
+    expect(reconciler.lastError).toContain('lnd down');
+
+    await reconciler.runSafely(); // third consecutive failure
+    expect(sendAlert).toHaveBeenCalledTimes(1);
+    expect(sendAlert.mock.calls[0][0]).toContain('CRITICAL');
+
+    await reconciler.runSafely(); // still failing: throttled
+    expect(sendAlert).toHaveBeenCalledTimes(1);
+  });
+
+  test('resets the failure counter after a successful pass', async () => {
+    const sendAlert = jest.fn().mockResolvedValue(true);
+    const getPayments = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('lnd down'))
+      .mockRejectedValueOnce(new Error('lnd down'))
+      .mockResolvedValue({ payments: [], next: null });
+    const reconciler = new PaymentReconciler(baseConfig(), sendAlert, {
+      db: makeDb(),
+      getPayments,
+      getInvoice: jest.fn(),
+    });
+
+    await reconciler.runSafely();
+    await reconciler.runSafely();
+    await reconciler.runSafely(); // succeeds
+
+    expect(reconciler.consecutivePassFailures).toBe(0);
+    expect(reconciler.lastError).toBeNull();
+    expect(sendAlert).not.toHaveBeenCalled();
+  });
+
+  test('keeps retrying the failure alert when delivery fails', async () => {
+    const sendAlert = jest.fn().mockResolvedValue(false);
+    const reconciler = failingReconciler(sendAlert);
+
+    await reconciler.runSafely();
+    await reconciler.runSafely();
+    await reconciler.runSafely(); // threshold reached, delivery fails
+    await reconciler.runSafely(); // must retry the alert, not throttle it
+
+    expect(sendAlert).toHaveBeenCalledTimes(2);
   });
 });

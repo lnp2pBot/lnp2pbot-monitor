@@ -186,6 +186,7 @@ app.use((req, res) => {
       'GET /',
       'GET /health',
       'GET /api/status',
+      'GET /api/reconciliation',
       'POST /api/heartbeat',
     ],
   });
@@ -245,31 +246,33 @@ const server = app.listen(PORT, () => {
 
   // Start payment reconciliation when configured. A start failure (MongoDB or
   // LND unreachable) must not go silent: this feature watches money leaving
-  // the node, so alert the admins and keep retrying until it comes up.
+  // the node, so alert the admins and keep retrying until it comes up. Alerts
+  // are throttled harder than retries so a long outage doesn't spam.
   if (reconciler) {
     const RECONCILIATION_START_RETRY_MS = 5 * 60 * 1000;
+    const START_FAILURE_ALERT_THROTTLE_MS = 60 * 60 * 1000;
+    let lastStartFailureAlertAt = 0;
     const startReconciliation = () => {
-      reconciler
-        .start()
-        .then(() => {
-          reconciler.lastError = null;
-        })
-        .catch((error) => {
-          reconciler.lastError = `Failed to start: ${error.message}`;
-          logger.error('Failed to start payment reconciliation, will retry', {
-            error: error.message,
-            stack: error.stack,
-            retryInMinutes: RECONCILIATION_START_RETRY_MS / 60000,
-          });
-          monitor
-            .sendAlertWithThrottling({
-              level: 'critical',
-              message: `🚨 CRITICAL: payment reconciliation failed to start: ${error.message}. Outgoing payments are NOT being monitored. Retrying every ${RECONCILIATION_START_RETRY_MS / 60000} minutes.`,
-              key: 'reconciliation_start_failed',
-            })
-            .catch(() => {});
-          setTimeout(startReconciliation, RECONCILIATION_START_RETRY_MS);
+      reconciler.start().catch(async (error) => {
+        reconciler.lastError = `Failed to start: ${error.message}`;
+        logger.error('Failed to start payment reconciliation, will retry', {
+          error: error.message,
+          stack: error.stack,
+          retryInMinutes: RECONCILIATION_START_RETRY_MS / 60000,
         });
+        if (
+          Date.now() - lastStartFailureAlertAt >
+          START_FAILURE_ALERT_THROTTLE_MS
+        ) {
+          const sent = await monitor
+            .sendAlert(
+              `🚨 CRITICAL: payment reconciliation failed to start: ${error.message}. Outgoing payments are NOT being monitored. Retrying every ${RECONCILIATION_START_RETRY_MS / 60000} minutes.`
+            )
+            .catch(() => false);
+          if (sent) lastStartFailureAlertAt = Date.now();
+        }
+        setTimeout(startReconciliation, RECONCILIATION_START_RETRY_MS);
+      });
     };
     startReconciliation();
   } else {

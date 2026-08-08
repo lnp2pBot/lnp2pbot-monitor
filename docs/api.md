@@ -231,6 +231,48 @@ Detailed status information (JSON).
 
 ---
 
+### GET /api/reconciliation
+
+Payment reconciliation status (JSON).
+
+**Purpose:** Check whether outgoing-payment reconciliation is enabled and
+healthy. When enabled, the monitor cross-checks every settled outgoing LND
+payment against the bot's database and alerts on anything unmatched.
+
+**Authentication:** None required
+
+**Response (disabled):**
+```json
+{
+  "enabled": false
+}
+```
+
+**Response (enabled):**
+```json
+{
+  "enabled": true,
+  "baselineAt": "2026-08-01T00:00:00.000Z",
+  "lastPaymentIndex": 12345,
+  "alertedPayments": 0,
+  "isRunning": false,
+  "lastError": null,
+  "consecutivePassFailures": 0
+}
+```
+
+- `baselineAt` - Only payments confirmed after this date are reconciled.
+- `lastPaymentIndex` - Checkpoint: LND payment index up to which payments
+  have been seen. Should track the node's latest payments; a value frozen
+  far behind means reconciliation is not keeping up.
+- `lastError` - `null` when the last pass succeeded, otherwise the last
+  failure (including a startup failure being retried).
+
+**Status Codes:**
+- `200 OK` - Status retrieved successfully
+
+---
+
 ## Rate Limiting
 
 The API implements rate limiting to prevent abuse:

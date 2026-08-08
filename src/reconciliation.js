@@ -4,6 +4,11 @@ const { logger } = require('./utils');
 
 const PAGE_SIZE = 250;
 const ALERT_RETENTION_DAYS = 90;
+// Alert the admins after this many consecutive failed passes, at most once
+// per throttle window. With the default 10-minute interval the first alert
+// fires after ~30 minutes without reconciliation.
+const PASS_FAILURE_ALERT_THRESHOLD = 3;
+const PASS_FAILURE_ALERT_THROTTLE_MS = 60 * 60 * 1000;
 
 /**
  * Reconciles outgoing Lightning payments made by the bot's node against the
@@ -39,6 +44,8 @@ class PaymentReconciler {
     this.isRunning = false;
     this.intervalHandle = null;
     this.lastError = null;
+    this.consecutivePassFailures = 0;
+    this.lastPassFailureAlertAt = 0;
     this.statePath =
       config.RECONCILIATION_STATE_FILE ||
       path.join(process.cwd(), 'data', 'reconciliation-state.json');
@@ -51,11 +58,24 @@ class PaymentReconciler {
       if (fs.existsSync(this.statePath)) {
         const parsed = JSON.parse(fs.readFileSync(this.statePath, 'utf8'));
         if (parsed && typeof parsed === 'object') {
+          // A hand-edited or corrupt baselineAt would parse to NaN and
+          // silently disable the baseline filter (every comparison against
+          // NaN is false), making the first pass classify the full payment
+          // history. Drop it and let run() set a fresh baseline instead.
+          let baselineAt = parsed.baselineAt || null;
+          if (baselineAt && isNaN(new Date(baselineAt).getTime())) {
+            logger.warn('Ignoring invalid baselineAt in reconciliation state', {
+              baselineAt,
+              statePath: this.statePath,
+            });
+            baselineAt = null;
+          }
           // Merge over defaults: a hand-edited or older-format file must not
           // leave fields like `alerted` undefined and crash every pass.
           return {
             ...defaults,
             ...parsed,
+            baselineAt,
             lastIndex: Number(parsed.lastIndex) || 0,
             alerted:
               parsed.alerted && typeof parsed.alerted === 'object'
@@ -130,22 +150,41 @@ class PaymentReconciler {
 
   /**
    * Fetch settled outgoing payments with index greater than state.lastIndex
-   * @returns {Promise<Array>} New payments, oldest first
+   *
+   * Pagination contract (LND ListPayments via the `lightning` library):
+   * - The library always queries with `reversed: true`, i.e. BACKWARDS
+   *   pagination: a request without token returns the NEWEST page and each
+   *   `next` token walks one page further back in history. Never send a
+   *   hand-made offset token: `index_offset` is exclusive and seeks backwards
+   *   from it, so `{offset: lastIndex}` would only ever return payments OLDER
+   *   than the checkpoint and no new payment would be seen again.
+   * - `include_incomplete` stays false, so only SUCCEEDED payments are
+   *   returned. In-flight payments are not listed at all and simply show up
+   *   in a later pass once they settle; failed payments never moved money.
+   *
+   * @returns {Promise<Array>} New payments, newest first (as LND returns them)
    */
   async fetchNewPayments() {
     const payments = [];
-    let token =
-      this.state.lastIndex > 0
-        ? JSON.stringify({ offset: this.state.lastIndex, limit: PAGE_SIZE })
-        : undefined;
+    let token; // start tokenless: the newest page
 
     for (;;) {
       const args = token ? { token } : { limit: PAGE_SIZE };
       const res = await this.lndGetPayments(args);
-      for (const payment of res.payments || []) {
-        if (payment.index > this.state.lastIndex) payments.push(payment);
+      const page = res.payments || [];
+
+      // Pages walk backwards through history: once a page contains a payment
+      // at or below the checkpoint, every further page is older still.
+      let reachedCheckpoint = false;
+      for (const payment of page) {
+        if (payment.index > this.state.lastIndex) {
+          payments.push(payment);
+        } else {
+          reachedCheckpoint = true;
+        }
       }
-      if (!res.next || (res.payments || []).length === 0) break;
+
+      if (reachedCheckpoint || !res.next || page.length === 0) break;
       token = res.next;
     }
     return payments;
@@ -320,10 +359,11 @@ class PaymentReconciler {
       const payments = await this.fetchNewPayments();
       let alerts = 0;
       let scanned = 0;
-      // LND assigns the payment index at initiation, so a payment observed
-      // in flight keeps its index after it settles. Never advance the
-      // checkpoint past a payment that still needs another look (unconfirmed,
-      // or its alert could not be delivered), or it would be skipped forever.
+      // Defense in depth: the LND call only returns settled payments
+      // (include_incomplete stays false), but keep the unconfirmed guard so
+      // that a payment observed in flight can never move the checkpoint past
+      // itself. The same protection covers payments whose alert delivery
+      // failed: they stay at or below the checkpoint and are retried.
       let highestSeen = this.state.lastIndex;
       let lowestUnresolved = Infinity;
 
@@ -380,28 +420,50 @@ class PaymentReconciler {
   }
 
   /**
+   * Run one pass without throwing: failures are recorded in lastError and,
+   * once they persist, reported to the admins. A reconciler that cannot run
+   * is silently providing no protection, so persistent failure must alert.
+   */
+  async runSafely() {
+    try {
+      const result = await this.run();
+      this.consecutivePassFailures = 0;
+      this.lastError = null;
+      return result;
+    } catch (error) {
+      this.consecutivePassFailures++;
+      this.lastError = `Reconciliation pass failed: ${error.message}`;
+      logger.error('Reconciliation pass failed', {
+        error: error.message,
+        stack: error.stack,
+        consecutiveFailures: this.consecutivePassFailures,
+      });
+
+      const throttled =
+        Date.now() - this.lastPassFailureAlertAt <
+        PASS_FAILURE_ALERT_THROTTLE_MS;
+      if (
+        this.consecutivePassFailures >= PASS_FAILURE_ALERT_THRESHOLD &&
+        !throttled
+      ) {
+        const sent = await this.sendAlert(
+          `🚨 CRITICAL: payment reconciliation has failed ${this.consecutivePassFailures} consecutive passes: ${error.message}. Outgoing payments are NOT being verified.`
+        ).catch(() => false);
+        if (sent) this.lastPassFailureAlertAt = Date.now();
+      }
+      return { scanned: 0, alerts: 0 };
+    }
+  }
+
+  /**
    * Connect and start periodic reconciliation
    */
   async start() {
     await this.connect();
     const intervalMs = this.config.RECONCILIATION_INTERVAL * 60 * 1000;
 
-    const safeRun = () =>
-      this.run()
-        .then((result) => {
-          this.lastError = null;
-          return result;
-        })
-        .catch((error) => {
-          this.lastError = `Reconciliation pass failed: ${error.message}`;
-          logger.error('Reconciliation pass failed', {
-            error: error.message,
-            stack: error.stack,
-          });
-        });
-
-    await safeRun();
-    this.intervalHandle = setInterval(safeRun, intervalMs);
+    await this.runSafely();
+    this.intervalHandle = setInterval(() => this.runSafely(), intervalMs);
 
     process.on('SIGTERM', () => this.stop());
     process.on('SIGINT', () => this.stop());
@@ -431,6 +493,7 @@ class PaymentReconciler {
       alertedPayments: Object.keys(this.state.alerted).length,
       isRunning: this.isRunning,
       lastError: this.lastError,
+      consecutivePassFailures: this.consecutivePassFailures,
     };
   }
 }
