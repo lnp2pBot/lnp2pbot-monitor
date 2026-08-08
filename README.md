@@ -180,8 +180,10 @@ ephemeral filesystems; `data/reconciliation-state.json` is kept as a local
 fallback when the Mongo credentials are read-only.
 
 Payments are classified page by page as they stream from LND, and pagination
-stops once a page is entirely older than the baseline — the first pass never
-loads the node's full payment history into memory.
+stops once a whole page was created more than 14 days before the baseline
+(the margin covers payments that sit in flight across the baseline before
+settling) — the first pass never loads the node's full payment history into
+memory.
 
 The reconciler also watches itself: if it cannot start (MongoDB or LND
 unreachable) it retries every 5 minutes and alerts the admins (throttled to
@@ -258,8 +260,10 @@ Payment reconciliation status.
 
 **Response:** `{"enabled": false}` when reconciliation is not configured,
 otherwise `{"enabled": true, "baselineAt": ..., "lastPaymentIndex": ...,
-"alertedPayments": ..., "isRunning": ..., "lastError": ...}` (`lastError` is
-`null` when the last pass succeeded).
+"alertedPayments": ..., "isRunning": ..., "stateStorage": ...,
+"lastError": ...}` (`lastError` is `null` when the last pass succeeded;
+`stateStorage` is `"mongodb"` when state is persisted in the bot's database
+or `"file"` when running on the local JSON fallback).
 
 ## Deployment
 

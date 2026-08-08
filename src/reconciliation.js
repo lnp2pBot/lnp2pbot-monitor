@@ -8,11 +8,19 @@ const ALERT_RETENTION_DAYS = 90;
 // redeploys); the JSON file is kept as a fallback for read-only credentials.
 const STATE_COLLECTION = 'monitor_reconciliation_state';
 const STATE_DOC_ID = 'reconciliation';
-// Stop paginating once a whole page predates the baseline by this margin.
-// The margin covers payments created before the baseline that settle after
-// it: without a cutoff the first pass walks the node's entire payment
-// history and can exhaust memory on small instances.
-const BASELINE_CUTOFF_MARGIN_MS = 24 * 60 * 60 * 1000;
+// Stop paginating once a whole page was CREATED before baseline - margin.
+// The cutoff must be decided on created_at: it is monotonic with the payment
+// index (and therefore with page order), while confirmed_at is not — a
+// payment can sit in flight and settle after newer payments confirmed. The
+// margin covers the longest a payment can stay in flight before settling
+// (bounded by the route's CLTV expiry, ~2 weeks of blocks), so a payment
+// created before the baseline that settles after it is still examined.
+// Without a cutoff the first pass walks the node's entire payment history
+// and can exhaust memory on small instances.
+const BASELINE_CUTOFF_MARGIN_MS = 14 * 24 * 60 * 60 * 1000;
+// MongoDB "Unauthorized": the credentials cannot write. Permanent, unlike
+// network blips or failovers which must be retried on the next pass.
+const MONGO_UNAUTHORIZED_CODE = 13;
 // Alert the admins after this many consecutive failed passes, at most once
 // per throttle window. With the default 10-minute interval the first alert
 // fires after ~30 minutes without reconciliation.
@@ -176,13 +184,23 @@ class PaymentReconciler {
           { upsert: true }
         );
     } catch (error) {
-      // Read-only credentials land here on the first save: keep running on
-      // the file fallback and stop retrying until the next restart.
-      this.remoteStateAvailable = false;
-      logger.error(
-        'Failed to save reconciliation state to MongoDB, using file only',
-        { error: error.message }
-      );
+      if (error.code === MONGO_UNAUTHORIZED_CODE) {
+        // Read-only credentials: permanent, stop retrying and run on the
+        // file fallback until the next restart.
+        this.remoteStateAvailable = false;
+        logger.error(
+          'MongoDB rejected the reconciliation state write (unauthorized), using file only',
+          { error: error.message }
+        );
+      } else {
+        // Transient (network blip, failover, timeout): the next pass
+        // retries the upsert. Disabling here would silently reintroduce
+        // state loss on ephemeral filesystems.
+        logger.error(
+          'Failed to save reconciliation state to MongoDB, will retry next pass',
+          { error: error.message }
+        );
+      }
     }
   }
 
@@ -245,8 +263,10 @@ class PaymentReconciler {
    *   in a later pass once they settle; failed payments never moved money.
    *
    * @param {function} handler - async (payment) => void, newest first
-   * @param {number} cutoffMs - stop paging when a whole page resolved before
-   *   this epoch-ms timestamp (0 disables the cutoff)
+   * @param {number} cutoffMs - stop paging when a whole page was CREATED
+   *   before this epoch-ms timestamp (0 disables the cutoff). The decision
+   *   must use created_at — monotonic with page order — never confirmed_at,
+   *   which is not (in-flight payments settle late).
    */
   async forEachNewPayment(handler, cutoffMs) {
     let token; // start tokenless: the newest page
@@ -259,24 +279,25 @@ class PaymentReconciler {
       // Pages walk backwards through history: once a page contains a payment
       // at or below the checkpoint, every further page is older still.
       let reachedCheckpoint = false;
-      let newestResolvedAt = 0;
+      let newestCreatedAt = 0;
       for (const payment of page) {
         if (payment.index > this.state.lastIndex) {
           await handler(payment);
         } else {
           reachedCheckpoint = true;
         }
-        const resolvedAt = new Date(
-          payment.confirmed_at || payment.created_at
+        const createdAt = new Date(
+          payment.created_at || payment.confirmed_at
         ).getTime();
-        if (resolvedAt > newestResolvedAt) newestResolvedAt = resolvedAt;
+        if (createdAt > newestCreatedAt) newestCreatedAt = createdAt;
       }
 
       if (reachedCheckpoint || !res.next || page.length === 0) break;
-      // Baseline cutoff: when even the newest payment of this page resolved
-      // before the cutoff, deeper (older) pages cannot contain anything
-      // classifiable — stop instead of walking the full history.
-      if (cutoffMs && newestResolvedAt && newestResolvedAt < cutoffMs) break;
+      // Baseline cutoff: when even the newest payment of this page was
+      // created before the cutoff, deeper (older) pages were created earlier
+      // still and cannot contain anything classifiable — stop instead of
+      // walking the full history.
+      if (cutoffMs && newestCreatedAt && newestCreatedAt < cutoffMs) break;
       token = res.next;
     }
   }

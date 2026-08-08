@@ -59,7 +59,7 @@ const makeDb = ({
   orders = [],
   pendingPayments = [],
   stateDocs = {},
-  failStateWrites = false,
+  stateWriteError = null,
 } = {}) => {
   const matches = (doc, query) => {
     for (const [key, value] of Object.entries(query)) {
@@ -88,7 +88,15 @@ const makeDb = ({
         return {
           findOne: async (query) => stateDocs[query._id] || null,
           updateOne: async (query, update) => {
-            if (failStateWrites) throw new Error('not authorized on db');
+            // stateWriteError: { code?, message?, remaining? } — `remaining`
+            // limits how many writes fail (undefined = all of them)
+            if (stateWriteError && stateWriteError.remaining !== 0) {
+              if (stateWriteError.remaining) stateWriteError.remaining--;
+              const err = new Error(stateWriteError.message || 'write failed');
+              if (stateWriteError.code !== undefined)
+                err.code = stateWriteError.code;
+              throw err;
+            }
             stateDocs[query._id] = { _id: query._id, ...update.$set };
           },
         };
@@ -474,6 +482,60 @@ describe('PaymentReconciler.forEachNewPayment', () => {
     expect(firstAlertOrder).toBeLessThan(secondFetchOrder);
   });
 
+  test('still classifies a payment that confirmed late (in-flight across the baseline)', async () => {
+    // confirmed_at is NOT monotonic with the payment index: a payment can
+    // sit in flight for days and settle after newer payments already
+    // confirmed. The pagination cutoff must therefore be decided on
+    // created_at (monotonic with index), never on confirmed_at — otherwise
+    // an "old looking" page would stop the walk and hide a deeper payment
+    // that settled after the baseline.
+    const baseline = new Date('2026-01-01T00:00:00.000Z').getTime();
+    const dayMs = 24 * 60 * 60 * 1000;
+    const iso = (ms) => new Date(ms).toISOString();
+    const recent = makePayment({
+      id: 'e'.repeat(64),
+      index: 30,
+      created_at: iso(baseline + dayMs),
+      confirmed_at: iso(baseline + dayMs),
+    });
+    // Page 2: created and confirmed shortly BEFORE the baseline — with a
+    // confirmed_at cutoff this page would look "done" and stop the walk.
+    const preBaseline = makePayment({
+      id: 'f'.repeat(64),
+      index: 20,
+      created_at: iso(baseline - 2 * dayMs),
+      confirmed_at: iso(baseline - 2 * dayMs),
+    });
+    // Page 3: created before page 2 (lower index) but confirmed AFTER the
+    // baseline — a payment that was in flight across the baseline.
+    const lateSettle = makePayment({
+      id: ROGUE_HASH,
+      index: 10,
+      created_at: iso(baseline - 3 * dayMs),
+      confirmed_at: iso(baseline + dayMs),
+    });
+    const getPayments = jest.fn(async ({ token }) => {
+      if (!token) return { payments: [recent], next: 'page-2' };
+      if (token === 'page-2')
+        return { payments: [preBaseline], next: 'page-3' };
+      return { payments: [lateSettle], next: null };
+    });
+    const sendAlert = jest.fn().mockResolvedValue(true);
+    const reconciler = new PaymentReconciler(baseConfig(), sendAlert, {
+      db: makeDb(),
+      getPayments,
+      getInvoice: jest.fn(),
+    });
+
+    const { scanned, alerts } = await reconciler.run();
+
+    // recent and lateSettle confirmed after the baseline: both classified.
+    expect(scanned).toBe(2);
+    expect(alerts).toBe(2);
+    const alertedHashes = sendAlert.mock.calls.map(([msg]) => msg);
+    expect(alertedHashes.join('\n')).toContain(ROGUE_HASH);
+  });
+
   test('stops paginating once a full page predates the baseline', async () => {
     // Pages walk backwards in time: when even the newest payment of a page
     // is older than the baseline (minus the in-flight margin), every deeper
@@ -609,12 +671,15 @@ describe('PaymentReconciler state persistence in MongoDB', () => {
     expect(reconciler.intervalHandle).toBeNull();
   });
 
-  test('falls back to file-only state when mongo writes are rejected', async () => {
+  test('falls back to file-only state when mongo writes are unauthorized', async () => {
     const config = baseConfig();
     const payment = makePayment({ id: ROGUE_HASH, index: 7 });
     const sendAlert = jest.fn().mockResolvedValue(true);
     const reconciler = new PaymentReconciler(config, sendAlert, {
-      db: makeDb({ failStateWrites: true }),
+      // MongoDB code 13 = Unauthorized (read-only credentials)
+      db: makeDb({
+        stateWriteError: { code: 13, message: 'not authorized on db' },
+      }),
       getPayments: jest.fn().mockResolvedValue({ payments: [payment] }),
       getInvoice: jest.fn(),
     });
@@ -622,11 +687,41 @@ describe('PaymentReconciler state persistence in MongoDB', () => {
     await reconciler.connect();
     await expect(reconciler.run()).resolves.toEqual({ scanned: 1, alerts: 1 });
 
+    // Authorization failures are permanent: stop retrying mongo writes.
+    expect(reconciler.getStatus().stateStorage).toBe('file');
     // The file copy still works as fallback (read-only mongo credentials).
     const onDisk = JSON.parse(
       fs.readFileSync(config.RECONCILIATION_STATE_FILE, 'utf8')
     );
     expect(onDisk.lastIndex).toBe(7);
+  });
+
+  test('retries mongo state writes after a transient failure', async () => {
+    // A network blip, primary failover, or write timeout must NOT disable
+    // mongo persistence for the process lifetime: on ephemeral filesystems
+    // that silently reintroduces state loss on the next redeploy.
+    const stateDocs = {};
+    const stateWriteError = { message: 'primary stepped down', remaining: 1 };
+    const payment = makePayment({ id: ROGUE_HASH, index: 7 });
+    const getPayments = jest
+      .fn()
+      .mockResolvedValueOnce({ payments: [payment], next: null })
+      .mockResolvedValue({ payments: [], next: null });
+    const sendAlert = jest.fn().mockResolvedValue(true);
+    const reconciler = new PaymentReconciler(baseConfig(), sendAlert, {
+      db: makeDb({ stateDocs, stateWriteError }),
+      getPayments,
+      getInvoice: jest.fn(),
+    });
+
+    await reconciler.connect();
+    await reconciler.run(); // first save fails (transient)
+    expect(stateDocs.reconciliation).toBeUndefined();
+    expect(reconciler.getStatus().stateStorage).toBe('mongodb');
+
+    await reconciler.run(); // next pass retries the upsert and succeeds
+    expect(stateDocs.reconciliation).toBeDefined();
+    expect(stateDocs.reconciliation.lastIndex).toBe(7);
   });
 });
 
