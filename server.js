@@ -11,6 +11,11 @@ const PaymentReconciler = require('./src/reconciliation');
 const { createDashboard } = require('./src/dashboard');
 
 const app = express();
+// App Platform terminates TLS and forwards requests with X-Forwarded-For.
+// Trust exactly that one hop so req.ip is the real client address —
+// otherwise every client shares the proxy's IP and one rate-limit bucket,
+// and express-rate-limit logs a ValidationError on every request.
+app.set('trust proxy', 1);
 const monitor = new BotMonitor(config);
 const reconciler = config.RECONCILIATION_ENABLED
   ? new PaymentReconciler(config, (message) => monitor.sendAlert(message))
@@ -25,6 +30,9 @@ const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 100, // limit each IP to 100 requests per windowMs
   message: 'Too many requests from this IP, please try again later.',
+  // The platform health checker and external monitors poll /health far more
+  // often than the limit allows; a 429 would mark the container unhealthy.
+  skip: (req) => req.path === '/health',
 });
 app.use(limiter);
 

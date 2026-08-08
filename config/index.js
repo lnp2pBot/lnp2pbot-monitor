@@ -1,8 +1,12 @@
 require('dotenv').config();
 
+// PORT=0 is a valid request for an OS-assigned ephemeral port (used by the
+// test suite), so it must not fall through a `|| 3000` default.
+const parsedPort = parseInt(process.env.PORT, 10);
+
 const config = {
   // Server configuration
-  PORT: parseInt(process.env.PORT) || 3000,
+  PORT: Number.isNaN(parsedPort) ? 3000 : parsedPort,
   NODE_ENV: process.env.NODE_ENV || 'development',
 
   // Telegram bot configuration (required)
