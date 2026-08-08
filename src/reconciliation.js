@@ -532,7 +532,13 @@ class PaymentReconciler {
     pass.scanned++;
     const result = await this.classifyPayment(payment);
     if (result.verdict === 'alert') {
-      if (Date.now() - confirmedAt < UNMATCHED_ALERT_GRACE_MS) {
+      // The grace only covers the payout_hash write race, which produces
+      // `unmatched`. A matched order that fails verification is a stronger
+      // signal and alerts immediately.
+      if (
+        result.reason === 'unmatched' &&
+        Date.now() - confirmedAt < UNMATCHED_ALERT_GRACE_MS
+      ) {
         // The bot may not have written the backing record yet (settlement
         // races the DB write). Hold the checkpoint below this payment so the
         // next pass re-classifies it; alert only once the grace expires.
