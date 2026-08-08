@@ -1,5 +1,12 @@
 const TelegramBot = require('node-telegram-bot-api');
-const { logger, formatUptime, formatMemory, formatRelativeTime, validateHealthData, retryWithBackoff } = require('./utils');
+const {
+  logger,
+  formatUptime,
+  formatMemory,
+  formatRelativeTime,
+  validateHealthData,
+  retryWithBackoff,
+} = require('./utils');
 
 class BotMonitor {
   constructor(config) {
@@ -10,10 +17,11 @@ class BotMonitor {
     this.botMetrics = null;
     this.alertHistory = new Map(); // Prevent alert spam
     this.isStarted = false;
-    
+
     logger.info('BotMonitor initialized', {
       authRequired: !!config.AUTH_TOKEN,
-      missingHeartbeatThreshold: config.MISSING_HEARTBEAT_THRESHOLD + ' minutes',
+      missingHeartbeatThreshold:
+        config.MISSING_HEARTBEAT_THRESHOLD + ' minutes',
       criticalAlertThrottle: config.CRITICAL_ALERT_THROTTLE + ' minutes',
       warningAlertThrottle: config.WARNING_ALERT_THROTTLE + ' minutes',
     });
@@ -38,7 +46,7 @@ class BotMonitor {
       this.lastHeartbeat = Date.now();
       this.botMetrics = healthData;
       this.consecutiveFailures = 0;
-      
+
       logger.debug('Heartbeat recorded successfully', {
         bot: healthData.bot,
         dbState: healthData.dbState,
@@ -46,7 +54,7 @@ class BotMonitor {
         memory: formatMemory(healthData.memory?.rss || 0),
         uptime: formatUptime(healthData.uptime || 0),
       });
-      
+
       // Check for critical issues in real-time
       this.checkCriticalIssues(healthData);
     } catch (error) {
@@ -64,23 +72,25 @@ class BotMonitor {
    */
   async checkCriticalIssues(metrics) {
     const alerts = [];
-    
+
     // Database issues
     if (!metrics.dbConnected) {
       alerts.push({
         level: 'critical',
         message: '🚨 CRITICAL: MongoDB disconnected!',
-        key: 'db_disconnected'
+        key: 'db_disconnected',
       });
     }
-    
+
     // Lightning node issues
     if (!metrics.lightningConnected) {
-      const errorInfo = metrics.lastError ? `\nError: ${metrics.lastError}` : '';
+      const errorInfo = metrics.lastError
+        ? `\nError: ${metrics.lastError}`
+        : '';
       alerts.push({
         level: 'critical',
         message: `🚨 CRITICAL: Lightning node disconnected!${errorInfo}`,
-        key: 'ln_disconnected'
+        key: 'ln_disconnected',
       });
     } else if (metrics.lightningInfo) {
       // Lightning node connected but with issues
@@ -88,53 +98,45 @@ class BotMonitor {
         alerts.push({
           level: 'warning',
           message: '⚠️ Lightning node not synced to chain',
-          key: 'ln_not_synced_chain'
+          key: 'ln_not_synced_chain',
         });
       }
-      
+
       if (!metrics.lightningInfo.synced_to_graph) {
         alerts.push({
           level: 'warning',
           message: '⚠️ Lightning node not synced to graph',
-          key: 'ln_not_synced_graph'
+          key: 'ln_not_synced_graph',
         });
       }
-      
+
       if (metrics.lightningInfo.active_channels_count === 0) {
         alerts.push({
           level: 'warning',
           message: '⚠️ No active Lightning channels!',
-          key: 'ln_no_channels'
+          key: 'ln_no_channels',
         });
       }
     }
-    
+
     // Memory issues
-    const memoryMB = metrics.memory?.rss ? Math.round(metrics.memory.rss / 1024 / 1024) : 0;
+    const memoryMB = metrics.memory?.rss
+      ? Math.round(metrics.memory.rss / 1024 / 1024)
+      : 0;
     if (memoryMB > this.config.VERY_HIGH_MEMORY_THRESHOLD) {
       alerts.push({
         level: 'critical',
         message: `🚨 CRITICAL: Very high memory usage: ${memoryMB}MB`,
-        key: 'very_high_memory'
+        key: 'very_high_memory',
       });
     } else if (memoryMB > this.config.HIGH_MEMORY_THRESHOLD) {
       alerts.push({
         level: 'warning',
         message: `⚠️ High memory usage: ${memoryMB}MB`,
-        key: 'high_memory'
+        key: 'high_memory',
       });
     }
-    
-    // Very long uptime (might need restart)
-    const uptimeDays = metrics.uptime ? Math.floor(metrics.uptime / 86400) : 0;
-    if (uptimeDays > this.config.LONG_UPTIME_THRESHOLD) {
-      alerts.push({
-        level: 'info',
-        message: `📝 Long uptime: ${uptimeDays} days - consider restart for maintenance`,
-        key: 'long_uptime'
-      });
-    }
-    
+
     // Aggregate alerts that pass throttling into a single message
     const alertsToSend = [];
     for (const alert of alerts) {
@@ -144,7 +146,7 @@ class BotMonitor {
     }
 
     if (alertsToSend.length > 0) {
-      const aggregatedMessage = alertsToSend.map(a => a.message).join('\n\n');
+      const aggregatedMessage = alertsToSend.map((a) => a.message).join('\n\n');
       const success = await this.sendAlert(aggregatedMessage);
       if (success) {
         const now = Date.now();
@@ -163,7 +165,7 @@ class BotMonitor {
   shouldSendAlert(alert) {
     const now = Date.now();
     const lastSent = this.alertHistory.get(alert.key) || 0;
-    
+
     // Different throttling for different alert levels
     let throttleTime;
     switch (alert.level) {
@@ -179,11 +181,11 @@ class BotMonitor {
       default:
         throttleTime = this.config.WARNING_ALERT_THROTTLE * 60 * 1000;
     }
-    
+
     if (now - lastSent > throttleTime) {
       return true;
     }
-    
+
     const nextAllowedTime = new Date(lastSent + throttleTime);
     logger.debug('Alert throttled', {
       key: alert.key,
@@ -217,25 +219,31 @@ class BotMonitor {
 
     for (const chatId of chatIds) {
       try {
-        await retryWithBackoff(async () => {
-          await this.alertBot.sendMessage(chatId, message);
-        }, 3, 1000);
-        
+        await retryWithBackoff(
+          async () => {
+            await this.alertBot.sendMessage(chatId, message);
+          },
+          3,
+          1000
+        );
+
         logger.info('Alert sent successfully', {
-          message: message.substring(0, 100) + (message.length > 100 ? '...' : ''),
+          message:
+            message.substring(0, 100) + (message.length > 100 ? '...' : ''),
           chatId,
         });
         anySuccess = true;
       } catch (error) {
         logger.error('Failed to send alert', {
           error: error.message,
-          message: message.substring(0, 100) + (message.length > 100 ? '...' : ''),
+          message:
+            message.substring(0, 100) + (message.length > 100 ? '...' : ''),
           chatId,
           stack: error.stack,
         });
       }
     }
-    
+
     return anySuccess;
   }
 
@@ -247,32 +255,32 @@ class BotMonitor {
       logger.debug('No heartbeats received yet');
       return;
     }
-    
+
     const now = Date.now();
     const timeSinceLastHeartbeat = now - this.lastHeartbeat;
     const threshold = this.config.MISSING_HEARTBEAT_THRESHOLD * 60 * 1000; // Convert to ms
-    
+
     if (timeSinceLastHeartbeat > threshold) {
       this.consecutiveFailures++;
       const minutesAgo = Math.floor(timeSinceLastHeartbeat / 60000);
-      
+
       logger.warn('Missing heartbeat detected', {
         minutesAgo,
         consecutiveFailures: this.consecutiveFailures,
         threshold: this.config.MISSING_HEARTBEAT_THRESHOLD + ' minutes',
       });
-      
+
       if (this.consecutiveFailures === 1) {
         await this.sendAlertWithThrottling({
           level: 'warning',
           message: `⚠️ @lnp2pBot heartbeat missing (${minutesAgo} min ago)`,
-          key: 'missing_heartbeat'
+          key: 'missing_heartbeat',
         });
       } else if (this.consecutiveFailures >= 2) {
         await this.sendAlertWithThrottling({
           level: 'critical',
           message: `🚨 CRITICAL: @lnp2pBot silent for ${minutesAgo} minutes!`,
-          key: 'bot_silent'
+          key: 'bot_silent',
         });
       }
     } else {
@@ -282,12 +290,14 @@ class BotMonitor {
           consecutiveFailures: this.consecutiveFailures,
           minutesSinceLastHeartbeat: Math.floor(timeSinceLastHeartbeat / 60000),
         });
-        
+
         this.consecutiveFailures = 0;
-        
+
         // Send recovery notification for critical situations
         if (this.consecutiveFailures > 1) {
-          await this.sendAlert('✅ Bot heartbeat recovered - all systems operational');
+          await this.sendAlert(
+            '✅ Bot heartbeat recovered - all systems operational'
+          );
         }
       }
     }
@@ -304,13 +314,14 @@ class BotMonitor {
         isHealthy: false,
         lastSeen: null,
         consecutiveFailures: this.consecutiveFailures,
-        message: 'Waiting for first heartbeat from bot...'
+        message: 'Waiting for first heartbeat from bot...',
       };
     }
-    
+
     const m = this.botMetrics;
-    const isHealthy = this.consecutiveFailures === 0 && m.dbConnected && m.lightningConnected;
-    
+    const isHealthy =
+      this.consecutiveFailures === 0 && m.dbConnected && m.lightningConnected;
+
     return {
       status: isHealthy ? '✅ Healthy' : '🚨 Issues detected',
       isHealthy,
@@ -321,37 +332,40 @@ class BotMonitor {
       database: {
         connected: m.dbConnected,
         state: m.dbState || 'unknown',
-        status: m.dbConnected ? '✅ Connected' : '❌ Disconnected'
+        status: m.dbConnected ? '✅ Connected' : '❌ Disconnected',
       },
-      lightning: m.lightningConnected ? {
-        connected: true,
-        status: '✅ Connected',
-        alias: m.lightningInfo?.alias || 'Unknown',
-        channels: m.lightningInfo?.active_channels_count || 0,
-        peers: m.lightningInfo?.peers_count || 0,
-        synced_chain: m.lightningInfo?.synced_to_chain ? '✅' : '❌',
-        synced_graph: m.lightningInfo?.synced_to_graph ? '✅' : '❌',
-        block_height: m.lightningInfo?.block_height || 0,
-        version: m.lightningInfo?.version || 'Unknown'
-      } : {
-        connected: false,
-        status: '❌ Disconnected',
-        error: m.lastError || 'Connection failed'
-      },
+      lightning: m.lightningConnected
+        ? {
+            connected: true,
+            status: '✅ Connected',
+            alias: m.lightningInfo?.alias || 'Unknown',
+            channels: m.lightningInfo?.active_channels_count || 0,
+            peers: m.lightningInfo?.peers_count || 0,
+            synced_chain: m.lightningInfo?.synced_to_chain ? '✅' : '❌',
+            synced_graph: m.lightningInfo?.synced_to_graph ? '✅' : '❌',
+            block_height: m.lightningInfo?.block_height || 0,
+            version: m.lightningInfo?.version || 'Unknown',
+          }
+        : {
+            connected: false,
+            status: '❌ Disconnected',
+            error: m.lastError || 'Connection failed',
+          },
       process: {
         pid: m.processId,
         nodeEnv: m.nodeEnv || 'unknown',
         nodeVersion: process.version,
         platform: process.platform,
-        arch: process.arch
+        arch: process.arch,
       },
       monitoring: {
         consecutiveFailures: this.consecutiveFailures,
-        missingHeartbeatThreshold: this.config.MISSING_HEARTBEAT_THRESHOLD + ' minutes',
+        missingHeartbeatThreshold:
+          this.config.MISSING_HEARTBEAT_THRESHOLD + ' minutes',
         isMonitorHealthy: this.isStarted,
         monitorUptime: formatUptime(process.uptime()),
-        alertsThrottled: this.alertHistory.size
-      }
+        alertsThrottled: this.alertHistory.size,
+      },
     };
   }
 
@@ -363,24 +377,25 @@ class BotMonitor {
       logger.warn('Monitor already started');
       return;
     }
-    
+
     // Check for missing heartbeats every minute
     const checkInterval = setInterval(() => {
-      this.checkMissingHeartbeat().catch(error => {
+      this.checkMissingHeartbeat().catch((error) => {
         logger.error('Error checking missing heartbeat', {
           error: error.message,
           stack: error.stack,
         });
       });
     }, 60 * 1000);
-    
+
     // Cleanup interval on process exit
     process.on('SIGTERM', () => clearInterval(checkInterval));
     process.on('SIGINT', () => clearInterval(checkInterval));
-    
+
     this.isStarted = true;
     logger.info('Bot health monitoring started', {
-      missingHeartbeatThreshold: this.config.MISSING_HEARTBEAT_THRESHOLD + ' minutes',
+      missingHeartbeatThreshold:
+        this.config.MISSING_HEARTBEAT_THRESHOLD + ' minutes',
       checkInterval: '1 minute',
     });
   }
@@ -395,7 +410,7 @@ class BotMonitor {
         botName: botInfo.username,
         botId: botInfo.id,
       });
-      
+
       // Send a test message
       await this.sendAlert('🧪 Test alert - lnp2pBot monitor is starting up');
       return true;
