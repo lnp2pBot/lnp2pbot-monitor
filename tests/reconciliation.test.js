@@ -374,6 +374,92 @@ describe('PaymentReconciler.run', () => {
     expect(reconciler.state.lastIndex).toBe(12);
   });
 
+  test('gives a recently settled unmatched payment a grace period before alerting', async () => {
+    // Race observed in production: LND settles the payout seconds before the
+    // bot writes payout_hash to the order. A payment that settled moments
+    // ago must be rechecked on later passes, not alerted immediately.
+    const orders = [];
+    const now = new Date();
+    const payment = makePayment({
+      id: PAYOUT_HASH,
+      index: 5,
+      confirmed_at: now.toISOString(),
+      created_at: now.toISOString(),
+    });
+    const config = { ...baseConfig(), RECONCILIATION_START_DATE: undefined };
+    const sendAlert = jest.fn().mockResolvedValue(true);
+    const reconciler = new PaymentReconciler(config, sendAlert, {
+      db: makeDb({ orders }),
+      getPayments: jest.fn().mockResolvedValue({ payments: [payment] }),
+      getInvoice: jest.fn(async () => settledHoldInvoice()),
+    });
+    reconciler.state.baselineAt = '2026-01-01T00:00:00.000Z';
+
+    const first = await reconciler.run();
+
+    // No alert yet, and the checkpoint must not advance past the payment so
+    // the next pass re-classifies it.
+    expect(first.alerts).toBe(0);
+    expect(sendAlert).not.toHaveBeenCalled();
+    expect(reconciler.state.lastIndex).toBeLessThan(5);
+
+    // The bot finishes its write: the order now backs the payment.
+    orders.push(makeOrder());
+
+    const second = await reconciler.run();
+
+    expect(second.alerts).toBe(0);
+    expect(sendAlert).not.toHaveBeenCalled();
+    expect(reconciler.state.lastIndex).toBe(5);
+  });
+
+  test('order mismatches alert immediately even within the grace period', async () => {
+    // The grace period exists only for the payout_hash write race, which by
+    // definition produces `unmatched`. A payment that already matched an
+    // order but fails verification (unsettled hold invoice, wrong amounts)
+    // is a stronger signal and must never be delayed.
+    const now = new Date();
+    const payment = makePayment({
+      confirmed_at: now.toISOString(),
+      created_at: now.toISOString(),
+    });
+    const config = { ...baseConfig(), RECONCILIATION_START_DATE: undefined };
+    const sendAlert = jest.fn().mockResolvedValue(true);
+    const reconciler = new PaymentReconciler(config, sendAlert, {
+      db: makeDb({ orders: [makeOrder()] }),
+      getPayments: jest.fn().mockResolvedValue({ payments: [payment] }),
+      // Hold invoice never settled: money went out without coming in.
+      getInvoice: jest.fn(async () => ({
+        is_confirmed: false,
+        is_held: true,
+        received: 0,
+      })),
+    });
+    reconciler.state.baselineAt = '2026-01-01T00:00:00.000Z';
+
+    const { alerts } = await reconciler.run();
+
+    expect(alerts).toBe(1);
+    expect(sendAlert).toHaveBeenCalledTimes(1);
+    expect(sendAlert.mock.calls[0][0]).toContain('never settled');
+  });
+
+  test('alerts once the grace period expires without a matching record', async () => {
+    // Existing behavior guard: payments settled long ago (like every other
+    // fixture in this file) still alert immediately — the grace period only
+    // shields the freshly settled.
+    const payment = makePayment({
+      id: ROGUE_HASH,
+      confirmed_at: '2026-06-01T12:00:00.000Z',
+    });
+    const { reconciler, sendAlert } = makeReconciler({ payments: [payment] });
+
+    const { alerts } = await reconciler.run();
+
+    expect(alerts).toBe(1);
+    expect(sendAlert).toHaveBeenCalledTimes(1);
+  });
+
   test('verified payments do not trigger alerts', async () => {
     const { reconciler, sendAlert } = makeReconciler({
       payments: [makePayment()],

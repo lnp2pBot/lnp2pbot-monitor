@@ -173,7 +173,10 @@ original hold invoice.
 
 Any settled outgoing payment that fails these checks triggers a critical
 Telegram alert including the amount, destination pubkey, payment hash,
-invoice, and timestamps. Each payment hash is alerted only once. State
+invoice, and timestamps. Payments settled less than 10 minutes ago get a
+grace period first: LND can settle a payout seconds before the bot persists
+the backing record, so fresh unmatched payments are rechecked on later
+passes and only alerted once the grace expires. Each payment hash is alerted only once. State
 (baseline, checkpoint, alert history) is persisted in the bot's MongoDB
 (`monitor_reconciliation_state` collection) so it survives redeploys and
 ephemeral filesystems; `data/reconciliation-state.json` is kept as a local
