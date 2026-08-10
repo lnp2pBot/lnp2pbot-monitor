@@ -42,6 +42,12 @@ const config = {
   LND_CERT_BASE64: process.env.LND_CERT_BASE64,
   LND_MACAROON_BASE64: process.env.LND_MACAROON_BASE64,
   RECONCILIATION_INTERVAL: parseInt(process.env.RECONCILIATION_INTERVAL) || 10, // minutes
+  // How long to wait before re-classifying an unmatched payment within a
+  // pass. Raise this while the bot persists payout records late (see bot
+  // PR #904); lower it back once the bot records hashes pre-flight.
+  RECONCILIATION_RECHECK_DELAY_MS: process.env.RECONCILIATION_RECHECK_DELAY_MS
+    ? parseInt(process.env.RECONCILIATION_RECHECK_DELAY_MS)
+    : undefined, // reconciler default: 60000
   RECONCILIATION_START_DATE: process.env.RECONCILIATION_START_DATE, // ISO date, optional
   RECONCILIATION_STATE_FILE: process.env.RECONCILIATION_STATE_FILE, // optional
 };
